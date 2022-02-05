@@ -205,14 +205,24 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
 
                     NET_VCA_FACESNAP_RESULT struAlarmInfo;
                     memcpy(&struAlarmInfo, p->pAlarmInfo, sizeof(NET_VCA_FACESNAP_RESULT));
+                    NET_VCA_DEV_INFO *dev = &struAlarmInfo.struDevInfo;
 
                     const char *pBuffer1 = (p->pAlarmInfo+offsetof(NET_VCA_FACESNAP_RESULT, pBuffer1));
                     // printf("%.*s\n", struAlarmInfo.dwFacePicLen, pBuffer1);
-                    payload = Py_BuildValue("{s:s,s:i,s:O}",
+                    payload = Py_BuildValue("{s:s,s:i,s:{s:s,s:i,s:i,s:i}}", //,s:f,s:f,s:O}",
                             "StorageIP", struAlarmInfo.sStorageIP,
                             "UploadEventDataType", struAlarmInfo.byUploadEventDataType,
-                            "FacePic", Py_None // PyByteArray_FromStringAndSize(pBuffer1, struAlarmInfo.dwFacePicLen)
-                        );
+                            "DevInfo",
+                                "IP", dev->struDevIP.sIpV4,
+                                "port", dev->wPort,
+                                "channel", dev->byChannel,
+                                "IvmsChannel", dev->byIvmsChannel
+                                );
+                    // ,
+                    //         "FaceWidth", struAlarmInfo.struRect.fWidth,
+                    //         "FaceHeight", struAlarmInfo.struRect.fHeight,
+                    //         "FacePic", PyByteArray_FromStringAndSize(pBuffer1, struAlarmInfo.dwFacePicLen)
+                    //     );
                     
                     break;
             }
@@ -228,8 +238,9 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                     NET_VCA_FACESNAP_MATCH_ALARM struAlarmInfo;
                     memcpy(&struAlarmInfo, p->pAlarmInfo, sizeof(NET_VCA_FACESNAP_MATCH_ALARM));
                     NET_VCA_HUMAN_ATTRIBUTE *person = &struAlarmInfo.struBlackListInfo.struBlackListInfo.struAttribute;
+                    NET_VCA_DEV_INFO *dev = &struAlarmInfo.struSnapInfo.struDevInfo;
 
-                    payload = Py_BuildValue("{s:s,s:i,s:f,s:i,s:i,s:i,s:i,s:i,s:f,s:{s:i,s:i,s:s,s:i}}", 
+                    payload = Py_BuildValue("{s:s,s:i,s:f,s:i,s:i,s:i,s:i,s:i,s:f,s:{s:s,s:i,s:i,s:i},s:{s:i,s:i,s:s,s:i}}", 
                             "StorageIP", struAlarmInfo.sStorageIP,
                             "LivenessDetectionStatus", struAlarmInfo.byLivenessDetectionStatus, //活体检测状态：0-保留，1-未知（检测失败），2-非真人人脸，3-真人人脸，4-未开启活体检测
                             "Similarity", struAlarmInfo.fSimilarity,
@@ -239,6 +250,11 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                             "Sex", struAlarmInfo.struSnapInfo.bySex,        //性别，0-未知，1-男，2-女,0xff-算法支持，但是没有识别出来
                             "Glasses", struAlarmInfo.struSnapInfo.byGlasses,     //是否带眼镜，0-未知，1-是，2-否,3-戴墨镜, 0xff-算法支持，但是没有识别出来
                             "StayDuration", struAlarmInfo.struSnapInfo.fStayDuration,
+                            "DevInfo",
+                                "IP", dev->struDevIP.sIpV4,
+                                "port", dev->wPort,
+                                "channel", dev->byChannel,
+                                "IvmsChannel", dev->byIvmsChannel,
                             "PersonInfo", 
                                 "RegisterID", struAlarmInfo.struBlackListInfo.struBlackListInfo.dwRegisterID,
                                 "Type", struAlarmInfo.struBlackListInfo.struBlackListInfo.byType,
