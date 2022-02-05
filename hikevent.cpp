@@ -566,6 +566,25 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                     sprintf(alarmTime, "%04d-%02d-%02d %02d:%02d:%02d.%03d", struAlarmInfo.struAlarmFixedHeader.struAlarmTime.wYear, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byMonth, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byDay, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byHour, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byMinute, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.bySecond, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byRes);
                     switch (struAlarmInfo.struAlarmFixedHeader.dwAlarmType)
                     {
+                        case 0:
+                        case 23:
+                            payload = Py_BuildValue("{s:i,s:s,s:i,s:i,s:i}", "dwAlarmType", struAlarmInfo.struAlarmFixedHeader.dwAlarmType, "alarmTime", alarmTime,
+                                "AlarmInputNo", struAlarmInfo.struAlarmFixedHeader.uStruAlarm.struIOAlarm.dwAlarmInputNo,
+                                "TrigerAlarmOutNum", struAlarmInfo.struAlarmFixedHeader.uStruAlarm.struIOAlarm.dwTrigerAlarmOutNum,
+                                "TrigerRecordChanNum", struAlarmInfo.struAlarmFixedHeader.uStruAlarm.struIOAlarm.dwTrigerRecordChanNum);
+                            break;
+                        case 2:
+                        case 3:
+                        case 6:
+                        case 9:
+                        case 10:
+                        case 11:
+                        case 13:
+                        case 15:
+                        case 16:
+                            payload = Py_BuildValue("{s:i,s:s,s:i}", "dwAlarmType", struAlarmInfo.struAlarmFixedHeader.dwAlarmType, "alarmTime", alarmTime,
+                                "AlarmChannelCount", struAlarmInfo.struAlarmFixedHeader.uStruAlarm.struAlarmChannel.dwAlarmChanNum);
+                            break;
                         case 1:
                         case 4:
                         case 5:
