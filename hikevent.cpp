@@ -124,8 +124,8 @@ hikevent_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 
     ps->struLoginInfo.wPort = 8000;
     memcpy(ps->struLoginInfo.sDeviceAddress, ps->ip, NET_DVR_DEV_ADDRESS_MAX_LEN);
-    memcpy(ps->struLoginInfo.sUserName, ps->user, NAME_LEN);
-    memcpy(ps->struLoginInfo.sPassword, ps->passwd, NAME_LEN);
+    memcpy(ps->struLoginInfo.sUserName, ps->user, strlen(ps->user) > NAME_LEN ? NAME_LEN : strlen(ps->user));
+    memcpy(ps->struLoginInfo.sPassword, ps->passwd, strlen(ps->passwd) > NAME_LEN ? NAME_LEN : strlen(ps->passwd));
 
     ps->lUserID = NET_DVR_Login_V40(&ps->struLoginInfo, &ps->struDeviceInfoV40);
 
