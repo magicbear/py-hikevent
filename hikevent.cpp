@@ -206,18 +206,34 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                     NET_VCA_FACESNAP_RESULT struAlarmInfo;
                     memcpy(&struAlarmInfo, p->pAlarmInfo, sizeof(NET_VCA_FACESNAP_RESULT));
                     NET_VCA_DEV_INFO *dev = &struAlarmInfo.struDevInfo;
+                    NET_VCA_HUMAN_FEATURE *human = &struAlarmInfo.struFeature;
 
                     const char *pBuffer1 = (p->pAlarmInfo+offsetof(NET_VCA_FACESNAP_RESULT, pBuffer1));
                     // printf("%.*s\n", struAlarmInfo.dwFacePicLen, pBuffer1);
-                    payload = Py_BuildValue("{s:s,s:i,s:{s:s,s:i,s:i,s:i}}", //,s:f,s:f,s:O}",
+                    payload = Py_BuildValue("{s:s,s:i,s:{s:s,s:i,s:i,s:i},s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i}", //,s:f,s:f,s:O}",
                             "StorageIP", struAlarmInfo.sStorageIP,
                             "UploadEventDataType", struAlarmInfo.byUploadEventDataType,
                             "DevInfo",
                                 "IP", dev->struDevIP.sIpV4,
                                 "port", dev->wPort,
                                 "channel", dev->byChannel,
-                                "IvmsChannel", dev->byIvmsChannel
-                                );
+                                "IvmsChannel", dev->byIvmsChannel,
+                            // "Human",
+                                "AgeGroup", human->byAgeGroup,    //年龄段,参见 HUMAN_AGE_GROUP_ENUM
+                                "Sex", human->bySex,         //性别, 0-表示“未知”（算法不支持）,1 – 男 , 2 – 女, 0xff-算法支持，但是没有识别出来
+                                "EyeGlass", human->byEyeGlass,    //是否戴眼镜 0-表示“未知”（算法不支持）,1 – 不戴, 2 – 戴,0xff-算法支持，但是没有识别出来
+                                //抓拍图片人脸年龄的使用方式，如byAge为15,byAgeDeviation为1,表示，实际人脸图片年龄的为14-16之间
+                                "Age", human->byAge,//年龄 0-表示“未知”（算法不支持）,0xff-算法支持，但是没有识别出来
+                                "AgeDeviation", human->byAgeDeviation,//年龄误差值
+                                "Ethnic", human->byEthnic,
+                                "Mask", human->byMask,       //是否戴口罩 0-表示“未知”（算法不支持）,1 – 不戴, 2 –戴普通眼镜, 3 –戴墨镜,0xff-算法支持，但是没有识别出来
+                                "Smile", human->bySmile,      //是否微笑 0-表示“未知”（算法不支持）,1 – 不微笑, 2 – 微笑, 0xff-算法支持，但是没有识别出来
+                                "FaceExpression", human->byFaceExpression,    /* 表情,参见FACE_EXPRESSION_GROUP_ENUM*/
+                                "Beard", human->byBeard, // 胡子, 0-不支持，1-没有胡子，2-有胡子，0xff-unknow表示未知,算法支持未检出
+                                "Race", human->byRace,
+                                "Hat", human->byHat // 帽子, 0-不支持,1-不戴帽子,2-戴帽子,0xff-unknow表示未知,算法支持未检出
+    
+                    );
                     // ,
                     //         "FaceWidth", struAlarmInfo.struRect.fWidth,
                     //         "FaceHeight", struAlarmInfo.struRect.fHeight,
