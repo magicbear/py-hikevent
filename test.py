@@ -24,6 +24,8 @@ except getopt.GetoptError:
     sys.exit(2)
 
 cam = hikevent.hikevent(ip, user, passwd)
+print(cam.startVoiceTalk(10))
+cam.sendVoice(open("test_8k.pcm", "rb").read())
 while True:
     evt = cam.getevent()
     if evt is not None:
