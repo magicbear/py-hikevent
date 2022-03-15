@@ -11,6 +11,17 @@
 #include <Python.h>
 #include "HCNetSDK.h"
 #include <sys/queue.h>
+#include <iconv.h>
+
+#include "LinuxPlayM4.h"
+#define USECOLOR 1
+
+// extern "C" { 
+// #include "libavcodec/avcodec.h"
+// #include "libavutil/common.h"
+// #include "libavutil/imgutils.h"
+// #include "libavutil/mathematics.h"
+// }
 
 using namespace std;
 
@@ -18,6 +29,7 @@ using namespace std;
 #define HPR_OK 0
 
 #define DVR_REMOTE_CALL_COMMAND 0x4000001
+#define DVR_VIDEO_DATA          0x4000002
 
 struct entry {
     long lCommand;
@@ -48,6 +60,12 @@ typedef struct {
     NET_DVR_USER_LOGIN_INFO struLoginInfo = {0};
     NET_DVR_DEVICEINFO_V40 struDeviceInfoV40 = {0};
 
+    LONG nPort;
+    // AVCodecContext *codec_ctx;
+    // AVCodecParserContext *parser;
+    // AVPacket *pkt;
+    // AVFrame *frame;
+
     /* Type-specific fields go here. */
 } PyHIKEvent_Object;
 
@@ -68,7 +86,6 @@ void CALLBACK MessageCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pA
 
     }
 }
-
 
 
 static PyObject *
@@ -107,6 +124,7 @@ hikevent_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     memcpy(ps->struLoginInfo.sUserName, ps->user, strlen(ps->user) > NAME_LEN ? NAME_LEN : strlen(ps->user));
     memcpy(ps->struLoginInfo.sPassword, ps->passwd, strlen(ps->passwd) > NAME_LEN ? NAME_LEN : strlen(ps->passwd));
 
+    ps->lVoiceHandler = -1;
     ps->lUserID = NET_DVR_Login_V40(&ps->struLoginInfo, &ps->struDeviceInfoV40);
 
     if (ps->lUserID < 0)
@@ -265,6 +283,52 @@ static PyObject *remoteCallCommand(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject *getChannelName(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+    NET_DVR_PICCFG_V40 picConfig;
+    long cameraNo;
+    DWORD lReceivedConfigSize;
+    if (!PyArg_ParseTuple(args, "I", &cameraNo)) {
+        return NULL;
+    }
+
+    if (!NET_DVR_GetDVRConfig(ps->lUserID, NET_DVR_GET_PICCFG_V40, cameraNo, &picConfig, sizeof(picConfig), &lReceivedConfigSize))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_PICCFG_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+
+    size_t srclen = strlen((char *)picConfig.sChanName);
+    char outbuf[NAME_LEN * 2];
+    size_t outlen = NAME_LEN * 2;
+    iconv_t cvSess = iconv_open("utf-8", "gb2312");
+
+    /* 由于iconv()函数会修改指针，所以要保存源指针 */
+    char *srcstart = (char *)picConfig.sChanName;
+    char *tempoutbuf = outbuf;
+
+    /* 进行转换
+    *@param cd iconv_open()产生的句柄
+    *@param srcstart 需要转换的字符串
+    *@param srclen 存放还有多少字符没有转换
+    *@param tempoutbuf 存放转换后的字符串
+    *@param outlen 存放转换后,tempoutbuf剩余的空间
+    *
+    * */
+    size_t ret = iconv (cvSess, &srcstart, &srclen, &tempoutbuf, &outlen);
+    if (ret == -1)
+    {
+        sprintf(ps->error_buffer, "iconv name to utf-8 error, %d\n", errno);
+        return NULL;
+    }
+
+    iconv_close(cvSess);
+
+    return Py_BuildValue("s#", outbuf, NAME_LEN * 2 - outlen);
+}
+
 void CALLBACK fdwVoiceDataCallBack(LONG lVoiceComHandle, char *pRecvDataBuffer, DWORD dwBufSize, BYTE byAudioFlag, DWORD pUser)
 {
 
@@ -275,38 +339,22 @@ void CALLBACK fVoiceDataCallBack(LONG lVoiceComHandle, char *pRecvDataBuffer, DW
 
 }
 
-static PyObject *startVoiceTalk(PyObject *self, PyObject *args) {
+static PyObject *addDVRChannel(PyObject *self, PyObject *args) {
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
 
+    NET_DVR_AUDIO_CHANNEL channelInfo;
+    memset(&channelInfo, 0, sizeof(NET_DVR_AUDIO_CHANNEL));
     long cameraNo;
     if (!PyArg_ParseTuple(args, "I", &cameraNo)) {
         return NULL;
     }
-
     if (cameraNo > 1)
     {
-        cameraNo = ps->struDeviceInfoV40.struDeviceV30.byStartDTalkChan + 10 - 1;
-    }
-    if (ps->lVoiceHandler != -1 && ps->lVoiceHandler != 0)
-    {
-        if (FALSE == NET_DVR_StopVoiceCom(ps->lVoiceHandler))
-        {
-            LONG pErrorNo = NET_DVR_GetLastError();
-            sprintf(ps->error_buffer, "NET_DVR_StopVoiceCom error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
-            PyErr_SetString(PyExc_TypeError, ps->error_buffer);
-            return NULL;
-        }
-    }
-    ps->lVoiceHandler = NET_DVR_StartVoiceCom_MR_V30(ps->lUserID, cameraNo, fVoiceDataCallBack, NULL);
-    if (ps->lVoiceHandler == -1)
-    {
-        LONG pErrorNo = NET_DVR_GetLastError();
-        sprintf(ps->error_buffer, "NET_DVR_StartVoiceCom_MR_V30 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
-        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
-        return NULL;
+        cameraNo = ps->struDeviceInfoV40.struDeviceV30.byStartDTalkChan + cameraNo - 1;
     }
 
-    if (FALSE == NET_DVR_GetCurrentAudioCompress(ps->lUserID, &ps->compressAudioType))
+    channelInfo.dwChannelNum = cameraNo;
+    if (FALSE == NET_DVR_GetCurrentAudioCompress_V50(ps->lUserID, &channelInfo, &ps->compressAudioType))
     {
         LONG pErrorNo = NET_DVR_GetLastError();
         sprintf(ps->error_buffer, "NET_DVR_GetCurrentAudioCompress error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
@@ -327,14 +375,104 @@ static PyObject *startVoiceTalk(PyObject *self, PyObject *args) {
         //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
         //     return NULL;
     }
-    return Py_BuildValue("{s:i,s:i}", "AudioEncode", ps->compressAudioType.byAudioEncType, 
-                        "SampleRate", sampleRate);
+
+    // NET_DVR_ClientAudioStart();
+    long lVoiceHandler = NET_DVR_AddDVR_V30(ps->lUserID, cameraNo);
+    if (lVoiceHandler == -1)
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_AddDVR_V30 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+
+    return Py_BuildValue("{s:i,s:i,s:i}", "AudioEncode", ps->compressAudioType.byAudioEncType, 
+                        "SampleRate", sampleRate, "handler", lVoiceHandler);
+}
+
+static PyObject *delDVRChannel(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    long handler;
+    if (!PyArg_ParseTuple(args, "I", &handler)) {
+        return NULL;
+    }
+    if (!NET_DVR_DelDVR_V30(handler))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_DelDVR_V30 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *startVoiceTalk(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    NET_DVR_AUDIO_CHANNEL channelInfo;
+    memset(&channelInfo, 0, sizeof(NET_DVR_AUDIO_CHANNEL));
+    long cameraNo;
+    if (!PyArg_ParseTuple(args, "I", &cameraNo)) {
+        return NULL;
+    }
+
+    if (cameraNo >= 1)
+    {
+        cameraNo = ps->struDeviceInfoV40.struDeviceV30.byStartDTalkChan + cameraNo - 1;
+    } else {
+        cameraNo = ps->struDeviceInfoV40.struDeviceV30.byStartDChan;
+    }
+    if (ps->lVoiceHandler != -1 && ps->lVoiceHandler != 0)
+    {
+        if (FALSE == NET_DVR_StopVoiceCom(ps->lVoiceHandler))
+        {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            sprintf(ps->error_buffer, "NET_DVR_StopVoiceCom error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+            return NULL;
+        }
+    }
+    ps->lVoiceHandler = NET_DVR_StartVoiceCom_MR_V30(ps->lUserID, cameraNo, fVoiceDataCallBack, NULL);
+    if (ps->lVoiceHandler == -1)
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_StartVoiceCom_MR_V30 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+
+    channelInfo.dwChannelNum = cameraNo;
+    if (FALSE == NET_DVR_GetCurrentAudioCompress_V50(ps->lUserID, &channelInfo, &ps->compressAudioType))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_GetCurrentAudioCompress error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+
+    int sampleRate = ps->compressAudioType.byAudioSamplingRate;
+    switch(ps->compressAudioType.byAudioSamplingRate)
+    {
+        case 1: sampleRate = 16000; break;
+        case 2: sampleRate = 32000; break;
+        case 3: sampleRate = 48000; break;
+        case 4: sampleRate = 44100; break;
+        case 5: sampleRate = 8000; break;
+        default: sampleRate = 8000; break;
+        // default:
+        //     sprintf(ps->error_buffer, "Unknow sample rate, %d\n", ps->compressAudioType.byAudioSamplingRate);
+        //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        //     return NULL;
+    }
+    return Py_BuildValue("{s:i,s:i,s:i}", "AudioEncode", ps->compressAudioType.byAudioEncType, 
+                        "SampleRate", sampleRate, "handler", ps->lVoiceHandler);
 }
 
 static PyObject *stopVoiceTalk(PyObject *self, PyObject *args) {
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
 
-    if (ps->lVoiceHandler == 0 || ps->lVoiceHandler == -1)
+    if (ps->lVoiceHandler == -1)
     {
         sprintf(ps->error_buffer, "Voice Talk is not started");
         PyErr_SetString(PyExc_TypeError, ps->error_buffer);
@@ -347,6 +485,7 @@ static PyObject *stopVoiceTalk(PyObject *self, PyObject *args) {
         PyErr_SetString(PyExc_TypeError, ps->error_buffer);
         return NULL;
     }
+    ps->lVoiceHandler = 0;
 
     Py_RETURN_NONE;
 }
@@ -356,7 +495,7 @@ static PyObject *sendVoice(PyObject *self, PyObject *args) {
 
     char *inputBuffer;
     Py_ssize_t bufferLength;
-    if (!PyArg_ParseTuple(args, "y#", &inputBuffer, &bufferLength)) {
+    if (!PyArg_ParseTuple(args, "y#|i", &inputBuffer, &bufferLength, &ps->compressAudioType.byAudioEncType)) {
         return NULL;
     }
 
@@ -462,6 +601,254 @@ static PyObject *sendVoice(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+ 
+
+void yv12toYUV(char *outYuv, char *inYv12, int width, int height, int widthStep)
+{
+    int col, row;
+    unsigned int Y, U, V;
+    int tmp;
+    int idx;
+//printf("widthStep=%d.\n",widthStep);
+
+    for (row = 0; row<height; row++)
+    {
+        idx = row * widthStep;
+        int rowptr = row*width;
+
+
+        for (col = 0; col<width; col++)
+        {
+//int colhalf=col>>1;
+            tmp = (row / 2)*(width / 2) + (col / 2);
+//         if((row==1)&&( col>=1400 &&col<=1600))
+//         {
+//          printf("col=%d,row=%d,width=%d,tmp=%d.\n",col,row,width,tmp);
+//          printf("row*width+col=%d,width*height+width*height/4+tmp=%d,width*height+tmp=%d.\n",row*width+col,width*height+width*height/4+tmp,width*height+tmp);
+//         }
+            Y = (unsigned int)inYv12[row*width + col];
+            U = (unsigned int)inYv12[width*height + width*height / 4 + tmp];
+            V = (unsigned int)inYv12[width*height + tmp];
+//         if ((col==200))
+//         {
+//         printf("col=%d,row=%d,width=%d,tmp=%d.\n",col,row,width,tmp);
+//         printf("width*height+width*height/4+tmp=%d.\n",width*height+width*height/4+tmp);
+//         return ;
+//         }
+            if ((idx + col * 3 + 2)> (1200 * widthStep))
+            {
+//printf("row * widthStep=%d,idx+col*3+2=%d.\n",1200 * widthStep,idx+col*3+2);
+            }
+            outYuv[idx + col * 3] = Y;
+            outYuv[idx + col * 3 + 1] = U;
+            outYuv[idx + col * 3 + 2] = V;
+        }
+    }
+//printf("col=%d,row=%d.\n",col,row);
+}
+
+
+static PyHIKEvent_Object *dec_ps;
+void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInfo, void * nReserved1, int nReserved2)
+{
+    long lFrameType = pFrameInfo->nType;
+    
+    if (dec_ps->nPort != nPort)
+        return;
+    
+    if (lFrameType == T_YV12)
+    {
+        char *yuvData = (char *)malloc(8 + pFrameInfo->nWidth * pFrameInfo->nHeight * 3);
+
+        *((uint32_t *)yuvData) = pFrameInfo->nWidth;
+        *((uint32_t *)yuvData+1) = pFrameInfo->nHeight;
+        yv12toYUV(yuvData + 8, pBuf, pFrameInfo->nWidth, pFrameInfo->nHeight, pFrameInfo->nWidth * 3);//nSize / pFrameInfo->nHeight);
+        // memcpy(yuvData, pBuf, nSize);
+
+        struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+        elem->lCommand = DVR_VIDEO_DATA;
+        // elem->pAlarmInfo = yuvData;
+        elem->pAlarmInfo = yuvData;
+        elem->dwBufLen = 8 + pFrameInfo->nWidth * pFrameInfo->nHeight * 3;
+        memcpy(elem->pAlarmInfo, yuvData, elem->dwBufLen);
+        pthread_mutex_lock(&dec_ps->lock);
+        TAILQ_INSERT_HEAD(&dec_ps->head, elem, entries);
+        pthread_mutex_unlock(&dec_ps->lock);
+    }
+}
+
+void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *pBuffer,DWORD dwBufSize,void* dwUser) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)dwUser;
+    int ret ;
+
+    switch (dwDataType) {
+        case NET_DVR_SYSHEAD: //系统头
+            if (!PlayM4_GetPort(&ps->nPort))
+                break;
+            if (dwBufSize > 0)
+            {
+                dec_ps = ps;
+                if (!PlayM4_OpenStream(ps->nPort, pBuffer, dwBufSize, 1024 * 1024))
+                {
+                    fprintf(stderr,"Error: PlayM4_OpenStream %d\n", PlayM4_GetLastError(ps->nPort));
+                }
+                if (!PlayM4_SetDecCallBack(ps->nPort, DecCBFun))
+                {
+                    fprintf(stderr,"Error: PlayM4_SetDecCallback %d\n", PlayM4_GetLastError(ps->nPort));
+                }
+                if (!PlayM4_Play(ps->nPort, NULL))
+                {
+                    fprintf(stderr,"Error: PlayM4_Play %d\n", PlayM4_GetLastError(ps->nPort));
+                }
+            }
+            break;
+        case NET_DVR_STREAMDATA: //码流数据
+            if (dwBufSize > 0 && ps->nPort != -1) {
+                dec_ps = ps;
+                BOOL inData = PlayM4_InputData(ps->nPort, pBuffer, dwBufSize);
+                while (!inData)
+                {
+                    inData = PlayM4_InputData(ps->nPort, pBuffer, dwBufSize);
+
+                }
+                // ret = av_parser_parse2(ps->parser, ps->codec_ctx, &ps->pkt->data, &ps->pkt->size,
+                //                        pBuffer, dwBufSize, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+                // if (ret < 0) {
+                //     fprintf(stderr, "Error while parsing\n");
+                //     exit(1);
+                // }
+                // if (ps->pkt->size > 0)
+                // {
+                //     ret = avcodec_send_packet(ps->codec_ctx, ps->pkt);
+                //     if (ret < 0) {
+                //         fprintf(stderr, "Error sending a packet for decoding\n");
+                //         // exit(1);
+                //     }
+                //     while (ret >= 0)
+                //     {
+                //         ret = avcodec_receive_frame(ps->codec_ctx, ps->frame);
+                //         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                //             return;
+                //         else if (ret < 0) {
+                //             fprintf(stderr, "Error during decoding\n");
+                //             exit(1);
+                //         }
+
+                //         printf("saving frame %3d\n", ps->codec_ctx->frame_number);
+                //         fflush(stdout);
+
+                //     }
+                // }
+            }
+            // printf("NET_DVR_SYSHEAD data,the size is %ld,%d.\n", time(NULL), dwBufSize);
+            break; 
+        default: //其他数据
+            printf("Other data,the size is %ld,%d.\n", time(NULL), dwBufSize);
+            break;
+    }
+}
+
+static PyObject *startRealPlay(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    long cameraNo;
+    long streamType = 0;
+    if (!PyArg_ParseTuple(args, "I|I", &cameraNo, &streamType)) {
+        return NULL;
+    }
+
+    // avcodec_register_all();
+
+    // AVPacket *pkt = av_packet_alloc();
+    // if (!pkt)
+    // {
+    //     sprintf(ps->error_buffer, "av_packet_alloc error\n");
+    //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+    //     return NULL;
+    // }
+
+    // /* find the MPEG-1 video decoder */
+    // const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    // if (!codec) {
+    //     sprintf(ps->error_buffer, "codec not found\n");
+    //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+    //     return NULL;
+    // }
+
+    // AVCodecParserContext *parser = av_parser_init(codec->id);
+    // if (!parser) {
+    //     sprintf(ps->error_buffer, "parser not found\n");
+    //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+    //     return NULL;
+    // }
+    // AVCodecContext *c= NULL;
+    // AVFrame *picture;
+    // c = avcodec_alloc_context3(codec);
+    // picture = av_frame_alloc();
+
+    // /* For some codecs, such as msmpeg4 and mpeg4, width and height
+    //    MUST be initialized there because this information is not
+    //    available in the bitstream. */
+
+    // /* For some codecs, such as msmpeg4 and mpeg4, width and height
+    //    MUST be initialized there because this information is not
+    //    available in the bitstream. */
+
+    // /* open it */
+    // if (avcodec_open2(c, codec, NULL) < 0) {
+    //     sprintf(ps->error_buffer, "could not open codec\n");
+    //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+    //     return NULL;
+    // }
+
+    // ps->parser = parser;
+    // ps->codec_ctx = c;
+    // ps->pkt = pkt;
+    // ps->frame = picture;
+
+    NET_DVR_PREVIEWINFO struPlayInfo = {0};
+    struPlayInfo.hPlayWnd     = 0;  // 仅取流不解码。这是Linux写法，Windows写法是struPlayInfo.hPlayWnd = NULL;
+    struPlayInfo.lChannel     = cameraNo; // 通道号
+    struPlayInfo.dwStreamType = streamType;  // 0- 主码流，1-子码流，2-码流3，3-码流4，以此类推
+    struPlayInfo.dwLinkMode   = 0;  // 0- TCP方式，1- UDP方式，2- 多播方式，3- RTP方式，4-RTP/RTSP，5-RSTP/HTTP
+    struPlayInfo.bBlocked     = 1;  // 0- 非阻塞取流，1- 阻塞取流
+    //struPlayInfo.dwDisplayBufNum = 1;
+
+    long lRealPlayHandle = NET_DVR_RealPlay_V40(ps->lUserID, &struPlayInfo, g_RealDataCallBack_V30, ps); // NET_DVR_RealPlay_V40 实时预览（支持多码流）。
+    //lRealPlayHandle = NET_DVR_RealPlay_V30(lUserID, &ClientInfo, NULL, NULL, 0); // NET_DVR_RealPlay_V30 实时预览。
+    if (lRealPlayHandle < 0) {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+        return NULL;
+    }
+    
+    return Py_BuildValue("i", lRealPlayHandle);
+}
+
+static PyObject *stopRealPlay(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    long lRealPlayHandle;
+    if (!PyArg_ParseTuple(args, "I", &lRealPlayHandle)) {
+        return NULL;
+    }
+
+    if (false == NET_DVR_StopRealPlay(lRealPlayHandle)) {    // 停止取流
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
 static PyObject *getevent(PyObject *self, PyObject *args) {
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
 
@@ -495,9 +882,28 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                     "RoomNumber", callParam->wRoomNumber);
                 break;
             }
+            case DVR_VIDEO_DATA:   // 自定义事件 -> DVR_REMOTE_CALL_COMMAND
+                command = "DVR_VIDEO_DATA";
+
+                payload = Py_BuildValue("y#", p->pAlarmInfo, p->dwBufLen);
+                break;
             case COMM_ALARM_RULE: // 行为分析信息 -> NET_VCA_RULE_ALARM
             {
                     command="COMM_ALARM_RULE";
+                    NET_VCA_RULE_ALARM *struAlarmInfo = (NET_VCA_RULE_ALARM *)p->pAlarmInfo;
+                    NET_VCA_DEV_INFO *dev = &struAlarmInfo->struDevInfo;
+                    
+                    payload = Py_BuildValue("{s:i,s:i,s:s,s:{s:s,s:i,s:i,s:i},s:i,s:y#}",
+                        "alarmTime", struAlarmInfo->dwAbsTime,
+                        "wEventType", struAlarmInfo->struRuleInfo.wEventTypeEx,
+                        "RuleName", struAlarmInfo->struRuleInfo.byRuleName, 
+                        "DevInfo",
+                                "IP", dev->struDevIP.sIpV4,
+                                "port", dev->wPort,
+                                "channel", dev->byChannel,
+                                "IvmsChannel", dev->byIvmsChannel,
+                        "picType", struAlarmInfo->byPicTransType,
+                        "image", struAlarmInfo->pImage, struAlarmInfo->dwPicDataLen);
                     break;
             }
             case COMM_ALARM_PDC: // 客流量统计报警信息 -> NET_DVR_PDC_ALRAM_INFO
@@ -1071,6 +1477,18 @@ static void release(PyObject *self) {
 
     pthread_mutex_destroy(&ps->lock);
 
+    if (ps->lVoiceHandler > 0)
+    {
+        if (!NET_DVR_StopVoiceCom(ps->lCallHandle))
+        {
+            sprintf(ps->error_buffer, "NET_DVR_StopVoiceCom error, %d\n", NET_DVR_GetLastError());
+            PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+            NET_DVR_Logout_V30(ps->lUserID);
+            NET_DVR_Cleanup(); 
+            return;
+        }
+    }
+
     if (ps->callChannelOpened)
     {
         if (!NET_DVR_StopRemoteConfig(ps->lCallHandle))
@@ -1143,6 +1561,26 @@ static PyMethodDef hiknvsevent_methods[] = {
     {
         "sendVoice", sendVoice, METH_VARARGS,
         "Send Voice to Remote"
+    },
+    {
+        "addDVRChannel", addDVRChannel, METH_VARARGS,
+        "Add DVR Channel"
+    },
+    {
+        "delDVRChannel", delDVRChannel, METH_VARARGS,
+        "Del DVR Channel"
+    },
+    {
+        "getChannelName", getChannelName, METH_VARARGS,
+        "Get DVR Channel Info"
+    },
+    {
+        "startRealPlay", startRealPlay, METH_VARARGS,
+        "Start Play"
+    },
+    {
+        "stopRealPlay", stopRealPlay, METH_VARARGS,
+        "Stop Play"
     },
     {NULL, NULL, 0, NULL}
 };

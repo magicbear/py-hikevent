@@ -4,6 +4,13 @@ import sys
 import getopt
 import json
 import base64
+import websockets
+import asyncio
+import threading
+import struct
+from scipy.signal import resample
+import numpy as np
+import cv2
 
 try:
     opts, _ = getopt.getopt(sys.argv[1:], "hu:p:H:", ["help", "user=", "passwd=", "ip="])
@@ -24,12 +31,24 @@ except getopt.GetoptError:
     sys.exit(2)
 
 cam = hikevent.hikevent(ip, user, passwd)
-print(cam.startVoiceTalk(10))
-cam.sendVoice(open("test_8k.pcm", "rb").read())
+# print(cam.addDVRChannel(9))
+# handler = cam.getChannelName(10)
+# print(cam.addDVRChannel(8))
+# print(handler)
+cam.startRealPlay(1,1)
+
+# cam.sendVoice(open("test_16k.pcm", "rb").read(), 0)
 while True:
     evt = cam.getevent()
     if evt is not None:
-        if evt['command'] == "COMM_UPLOAD_FACESNAP_RESULT":
+        if evt['command'] == "DVR_VIDEO_DATA":
+            size = struct.unpack("=LL", evt['payload'][0:8]);
+            frame = np.frombuffer(evt['payload'][8:], dtype=np.uint8).reshape((size[1], size[0], 3))
+
+            frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR)
+            cv2.imshow("frame", frame)
+            cv2.waitKey(1)
+        elif evt['command'] == "COMM_UPLOAD_FACESNAP_RESULT":
             # evt['payload']['FacePic'] = base64.b64encode(evt['payload']['FacePic']).decode('utf-8')
             print(json.dumps({
                 'devid': 'facesnap',
