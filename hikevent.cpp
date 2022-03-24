@@ -69,6 +69,15 @@ typedef struct {
     /* Type-specific fields go here. */
 } PyHIKEvent_Object;
 
+struct hikevent_queue_t {
+    long lCommand;
+    PyHIKEvent_Object *ps;
+    LONG nPort;
+    TAILQ_ENTRY(hikevent_queue_t) entries;
+};
+
+static TAILQ_HEAD(tailhead, hikevent_queue_t) hikq_head;
+
 void CALLBACK MessageCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pAlarmInfo, DWORD dwBufLen, void* pUser)
 {
     PyHIKEvent_Object *self = (PyHIKEvent_Object*)pUser;
@@ -136,6 +145,10 @@ hikevent_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     }
 
     NET_DVR_SetDVRMessageCallBack_V51(0, MessageCallback, (void *)ps);
+
+    struct hikevent_queue_t *elem = (struct hikevent_queue_t *)calloc(1, sizeof(struct hikevent_queue_t));
+    elem->ps = ps;
+    TAILQ_INSERT_HEAD(&hikq_head, elem, entries);
 
     return (PyObject *) ps;
 }
@@ -648,14 +661,28 @@ void yv12toYUV(char *outYuv, char *inYv12, int width, int height, int widthStep)
 }
 
 
-static PyHIKEvent_Object *dec_ps;
 void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInfo, void * nReserved1, int nReserved2)
 {
     long lFrameType = pFrameInfo->nType;
-    
-    if (dec_ps->nPort != nPort)
+    PyHIKEvent_Object *dec_ps = NULL;
+    hikevent_queue_t *q;
+
+    q = TAILQ_FIRST(&hikq_head);
+    while (q != NULL) {
+        if (q->ps->nPort == nPort)
+        {
+            dec_ps = q->ps;
+            break;
+        }        
+        
+        q = TAILQ_NEXT(q, entries);
+    }
+    if (dec_ps == NULL)
+    {
+        fprintf(stderr, "Error: cannnot found decode context\n");
         return;
-    
+    }
+
     if (lFrameType == T_YV12)
     {
         char *yuvData = (char *)malloc(8 + pFrameInfo->nWidth * pFrameInfo->nHeight * 3);
@@ -687,7 +714,6 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 break;
             if (dwBufSize > 0)
             {
-                dec_ps = ps;
                 if (!PlayM4_OpenStream(ps->nPort, pBuffer, dwBufSize, 1024 * 1024))
                 {
                     fprintf(stderr,"Error: PlayM4_OpenStream %d\n", PlayM4_GetLastError(ps->nPort));
@@ -704,7 +730,6 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
             break;
         case NET_DVR_STREAMDATA: //码流数据
             if (dwBufSize > 0 && ps->nPort != -1) {
-                dec_ps = ps;
                 BOOL inData = PlayM4_InputData(ps->nPort, pBuffer, dwBufSize);
                 while (!inData)
                 {
@@ -842,6 +867,99 @@ static PyObject *stopRealPlay(PyObject *self, PyObject *args) {
     if (false == NET_DVR_StopRealPlay(lRealPlayHandle)) {    // 停止取流
         LONG pErrorNo = NET_DVR_GetLastError();
         sprintf(ps->error_buffer, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+
+static PyObject *ptzControl(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    LONG lChannelNo;
+    DWORD dwPTZCommand;
+    DWORD stop = 0, speed = 1;
+    if (!PyArg_ParseTuple(args, "II|pI", &lChannelNo, &dwPTZCommand, &stop, &speed)) {
+        return NULL;
+    }
+    if (speed < 0 || speed > 7)
+    {
+        sprintf(ps->error_buffer, "Speed invalid, accept range 0-7\n");
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+        return NULL;
+    }
+    // LIGHT_PWRON 2 接通灯光电源 
+    // WIPER_PWRON 3 接通雨刷开关 
+    // FAN_PWRON 4 接通风扇开关 
+    // HEATER_PWRON 5 接通加热器开关 
+    // AUX_PWRON1 6 接通辅助设备开关 
+    // AUX_PWRON2 7 接通辅助设备开关 
+    // ZOOM_IN 11 焦距变大(倍率变大) 
+    // ZOOM_OUT 12 焦距变小(倍率变小) 
+    // FOCUS_NEAR 13 焦点前调 
+    // FOCUS_FAR 14 焦点后调 
+    // IRIS_OPEN 15 光圈扩大 
+    // IRIS_CLOSE 16 光圈缩小 
+    // TILT_UP 21 云台上仰 
+    // TILT_DOWN 22 云台下俯 
+    // PAN_LEFT 23 云台左转 
+    // PAN_RIGHT 24 云台右转 
+    // UP_LEFT 25 云台上仰和左转 
+    // UP_RIGHT 26 云台上仰和右转 
+    // DOWN_LEFT 27 云台下俯和左转 
+    // DOWN_RIGHT 28 云台下俯和右转 
+    // PAN_AUTO 29 云台左右自动扫描 
+    // TILT_DOWN_ZOOM_IN  58 云台下俯和焦距变大(倍率变大) 
+    // TILT_DOWN_ZOOM_OUT 59 云台下俯和焦距变小(倍率变小) 
+    // PAN_LEFT_ZOOM_IN 60 云台左转和焦距变大(倍率变大) 
+    // PAN_LEFT_ZOOM_OUT 61 云台左转和焦距变小(倍率变小) 
+    // PAN_RIGHT_ZOOM_IN 62 云台右转和焦距变大(倍率变大) 
+    // PAN_RIGHT_ZOOM_OUT 63 云台右转和焦距变小(倍率变小) 
+    // UP_LEFT_ZOOM_IN 64 云台上仰和左转和焦距变大(倍率变大) 
+    // UP_LEFT_ZOOM_OUT 65 云台上仰和左转和焦距变小(倍率变小) 
+    // UP_RIGHT_ZOOM_IN 66 云台上仰和右转和焦距变大(倍率变大) 
+    // UP_RIGHT_ZOOM_OUT 67 云台上仰和右转和焦距变小(倍率变小) 
+    // DOWN_LEFT_ZOOM_IN 68 云台下俯和左转和焦距变大(倍率变大) 
+    // DOWN_LEFT_ZOOM_OUT 69 云台下俯和左转和焦距变小(倍率变小) 
+    // DOWN_RIGHT_ZOOM_IN  70 云台下俯和右转和焦距变大(倍率变大) 
+    // DOWN_RIGHT_ZOOM_OUT 71 云台下俯和右转和焦距变小(倍率变小) 
+    // TILT_UP_ZOOM_IN 72 云台上仰和焦距变大(倍率变大) 
+    // TILT_UP_ZOOM_OUT 73 
+    if (!NET_DVR_PTZControlWithSpeed_Other(ps->lUserID, lChannelNo, dwPTZCommand, stop, speed))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_PTZControlWithSpeed_Other error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+        return NULL;
+    }
+    Py_RETURN_NONE;
+}
+
+
+static PyObject *ptzPreset(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    LONG lChannelNo;
+    DWORD dwPresetIndex;
+    DWORD dwPTZPresetCmd = GOTO_PRESET;
+    if (!PyArg_ParseTuple(args, "II|pI", &lChannelNo, &dwPresetIndex, &dwPTZPresetCmd)) {
+        return NULL;
+    }
+    if (dwPTZPresetCmd != GOTO_PRESET && dwPTZPresetCmd != SET_PRESET && dwPTZPresetCmd != CLE_PRESET)
+    {
+        sprintf(ps->error_buffer, "CMD Type invalid, accept SET_PRESET(8) CLE_PRESET(9) GOTO_PRESET(39)\n");
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+        return NULL;
+    }
+    if (!NET_DVR_PTZPreset_Other(ps->lUserID, lChannelNo, dwPTZPresetCmd, dwPresetIndex))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_PTZPreset_Other error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
         PyErr_SetString(PyExc_TypeError, ps->error_buffer);
         
         return NULL;
@@ -1478,6 +1596,14 @@ static void release(PyObject *self) {
 
     pthread_mutex_destroy(&ps->lock);
 
+    struct hikevent_queue_t *np, *q = NULL;
+
+    TAILQ_FOREACH(np, &hikq_head, entries)
+        if (np->ps == ps)
+            q = np;
+    if (q != NULL)
+        TAILQ_REMOVE(&hikq_head, q, entries);
+
     if (ps->lVoiceHandler > 0)
     {
         if (!NET_DVR_StopVoiceCom(ps->lCallHandle))
@@ -1583,6 +1709,14 @@ static PyMethodDef hiknvsevent_methods[] = {
         "stopRealPlay", stopRealPlay, METH_VARARGS,
         "Stop Play"
     },
+    {
+        "ptzControl", ptzControl, METH_VARARGS,
+        "PTZ Control"
+    },
+    {
+        "ptzPreset", ptzPreset, METH_VARARGS,
+        "PTZ Preset"
+    },
     {NULL, NULL, 0, NULL}
 };
 
@@ -1629,6 +1763,8 @@ PyMODINIT_FUNC PyInit_hikevent(void) {
         Py_DECREF(m);
         return NULL;
     }
+
+    TAILQ_INIT(&hikq_head);
 
     return m;
 
