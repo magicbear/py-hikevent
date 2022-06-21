@@ -1260,6 +1260,17 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
             case COMM_VEHICLE_CONTROL_ALARM: // 黑白名单车辆报警上传 -> NET_DVR_VEHICLE_CONTROL_ALARM
             {
                     command="COMM_VEHICLE_CONTROL_ALARM";
+                    NET_DVR_VEHICLE_CONTROL_ALARM *struAlarmInfo = (NET_DVR_VEHICLE_CONTROL_ALARM *)p->pAlarmInfo;
+                    
+                    payload = Py_BuildValue("{s:i,s:i,s:i,s:y#,s:y#,s:i,s:y#}", 
+                            "ListType", struAlarmInfo->byListType,
+                            "PlateType", struAlarmInfo->byPlateType,
+                            "PlateColor", struAlarmInfo->byPlateColor,
+                            "License", struAlarmInfo->sLicense, strlen(struAlarmInfo->sLicense),
+                            "CardNo", struAlarmInfo->sCardNo, strlen(struAlarmInfo->sCardNo),
+                            "PicType", struAlarmInfo->byPicType,
+                            "Picture", struAlarmInfo->pPicData, struAlarmInfo->dwPicDataLen
+                        );
                     break;
             }
             case COMM_FIRE_ALARM: // 消防报警上传 -> NET_DVR_FIRE_ALARM
