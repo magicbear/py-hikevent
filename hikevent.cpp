@@ -1255,6 +1255,12 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
             case COMM_VEHICLE_CONTROL_LIST_DSALARM: // 车辆黑白名单数据需要同步报警上传 -> NET_DVR_VEHICLE_CONTROL_LIST_DSALARM
             {
                     command="COMM_VEHICLE_CONTROL_LIST_DSALARM";
+                    NET_DVR_VEHICLE_CONTROL_LIST_DSALARM *struAlarmInfo = (NET_DVR_VEHICLE_CONTROL_LIST_DSALARM *)p->pAlarmInfo;
+
+                    payload = Py_BuildValue("{s:i,s:y#}", 
+                            "dataIndex", struAlarmInfo->dwDataIndex,
+                            "operateIndex", struAlarmInfo->sOperateIndex, MAX_OPERATE_INDEX_LEN
+                        );
                     break;
             }
             case COMM_VEHICLE_CONTROL_ALARM: // 黑白名单车辆报警上传 -> NET_DVR_VEHICLE_CONTROL_ALARM
