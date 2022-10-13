@@ -35,9 +35,13 @@ cam = hikevent.hikevent(ip, user, passwd)
 # handler = cam.getChannelName(10)
 # print(cam.addDVRChannel(8))
 # print(handler)
-cam.startRealPlay(1,1)
+#print(cam.SmartSearchPicture(43,0,0,int(time.time()-3600*12)))
+# cam.startRealPlay(1,1)
 
-# cam.sendVoice(open("test_16k.pcm", "rb").read(), 0)
+with open('test.jpg', 'wb') as f:
+    # print()
+    f.write(cam.getPicture(1))
+# cam.sendVoice(open("test_16k.pcm", "rb").read(), 16)
 while True:
     evt = cam.getevent()
     if evt is not None:

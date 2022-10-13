@@ -31,6 +31,8 @@ using namespace std;
 #define DVR_REMOTE_CALL_COMMAND 0x4000001
 #define DVR_VIDEO_DATA          0x4000002
 
+#define sprintfDVRTime(struAlarmTime) "%04d-%02d-%02d %02d:%02d:%02d", struAlarmTime.wYear, struAlarmTime.byMonth, struAlarmTime.byDay, struAlarmTime.byHour, struAlarmTime.byMinute, struAlarmTime.bySecond
+
 struct entry {
     long lCommand;
     char *pAlarmInfo;
@@ -294,6 +296,90 @@ static PyObject *remoteCallCommand(PyObject *self, PyObject *args) {
     //     NET_DVR_StartVoiceCom_V30(ps->lUserID, 1, 0, NULL, NULL);
     // }
     Py_RETURN_NONE;
+}
+
+
+static PyObject *getDeviceInfo(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+    NET_DVR_DEV_BASE_INFO devConfig;
+    DWORD lReceivedConfigSize;
+    NET_DVR_DEVICEID_INFO devInfo;
+    uint32_t lpStatusList;
+
+    memset(&devInfo, 0, sizeof(devInfo));
+    devInfo.dwSize = sizeof(NET_DVR_DEVICEID_INFO);
+
+    if (!NET_DVR_GetDeviceConfig(ps->lUserID, NET_DVR_GET_DEV_BASEINFO, 1, &devInfo, sizeof(devInfo), &lpStatusList, &devConfig, sizeof(devConfig)))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_GetDeviceConfig error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+
+    size_t srclen = strlen((char *)devConfig.sDevName);
+    char outbuf[NAME_LEN * 2];
+    size_t outlen = NAME_LEN * 2;
+    iconv_t cvSess = iconv_open("utf-8", "gb2312");
+
+    /* 由于iconv()函数会修改指针，所以要保存源指针 */
+    char *srcstart = (char *)devConfig.sDevName;
+    char *tempoutbuf = outbuf;
+
+    /* 进行转换
+    *@param cd iconv_open()产生的句柄
+    *@param srcstart 需要转换的字符串
+    *@param srclen 存放还有多少字符没有转换
+    *@param tempoutbuf 存放转换后的字符串
+    *@param outlen 存放转换后,tempoutbuf剩余的空间
+    *
+    * */
+    size_t ret = iconv (cvSess, &srcstart, &srclen, &tempoutbuf, &outlen);
+    if (ret == -1)
+    {
+        sprintf(ps->error_buffer, "iconv name to utf-8 error, %d\n", errno);
+        return NULL;
+    }
+
+    iconv_close(cvSess);
+
+    // return Py_BuildValue("{s:s#,s:i,s:s}", "DVRName", outbuf, NAME_LEN * 2 - outlen, "DVRID", devConfig.dwDVRID, "SN", devConfig.sSerialNumber );
+    return Py_BuildValue("{s:s#,s:i,s:s}", "DevName", outbuf, NAME_LEN * 2 - outlen );
+}
+
+static PyObject *getPicture(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+    NET_DVR_PICPARAM_V50 picParams;
+
+    memset(&picParams, 0, sizeof(picParams));
+    picParams.struParam.wPicSize = 5;
+    picParams.struParam.wPicQuality = 1;
+
+    long lChannelNo = 1;
+    if (!PyArg_ParseTuple(args, "|I", &lChannelNo)) {
+        return NULL;
+    }
+
+    char *picBuffer = (char *)malloc(16 * 1048576); // 16 MB Buffer
+    DWORD picSize = 0;
+    if (picBuffer == NULL)
+    {
+        sprintf(ps->error_buffer, "allocate buffer failed\n");
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+    if (!NET_DVR_CapturePicture_V50(ps->lUserID, lChannelNo, &picParams, picBuffer, 16 * 1048576, &picSize))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_CapturePicture_V50 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+
+    PyObject *ret = Py_BuildValue("y#", picBuffer, picSize);
+    free(picBuffer);
+    return ret;
+
 }
 
 static PyObject *getChannelName(PyObject *self, PyObject *args) {
@@ -965,6 +1051,148 @@ static PyObject *ptzPreset(PyObject *self, PyObject *args) {
         return NULL;
     }
     Py_RETURN_NONE;
+}
+
+NET_DVR_TIME_EX timestampToDVRTime(const time_t t)
+{
+    struct tm *ptm = localtime(&t);
+    NET_DVR_TIME_EX r;
+    r.wYear = ptm->tm_year + 1900;
+    r.byMonth = ptm->tm_mon + 1;
+    r.byDay = ptm->tm_mday;
+    r.byHour = ptm->tm_hour;
+    r.byMinute = ptm->tm_min;
+    r.bySecond = ptm->tm_sec;
+    return r;
+}
+
+time_t DVRTimeTotimestamp(const NET_DVR_TIME_EX r)
+{
+    struct tm stm;
+    struct tm *ptm = &stm;
+    memset(ptm, 0, sizeof(struct tm));
+    ptm->tm_year = r.wYear - 1900;
+    ptm->tm_mon = r.byMonth - 1;
+    ptm->tm_mday = r.byDay;
+    ptm->tm_hour = r.byHour;
+    ptm->tm_min = r.byMinute;
+    ptm->tm_sec = r.bySecond;
+    
+    return mktime(ptm);
+}
+
+static PyObject *SmartSearchPicture(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    NET_DVR_SMART_SEARCH_PIC_PARA findParams;
+    memset(&findParams, 0, sizeof(findParams));
+    time_t     tStart = 0, tEnd = 0;
+
+    if (!PyArg_ParseTuple(args, "|IIIII", &findParams.dwChanNo, &findParams.byStreamID, &findParams.wSearchType, &tStart, &tEnd)) {
+        return NULL;
+    }
+
+    if (tStart == 0)
+        tStart = time(NULL) - 86400;
+    if (tEnd == 0)
+        tEnd = time(NULL);
+
+    findParams.struStartTime = timestampToDVRTime(tStart);
+    findParams.struEndTime = timestampToDVRTime(tEnd);
+
+    LONG lHandle;
+    if (-1 == (lHandle = NET_DVR_SmartSearchPicture(ps->lUserID, &findParams)))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_SmartSearchPicture error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+        return NULL;
+    }
+
+    PyObject *list = PyList_New(0);
+    int hasError = false;
+    while (!hasError)
+    {
+        NET_DVR_SMART_SEARCH_PIC_RET struFindData;
+        LONG rc = NET_DVR_FindNextSmartPicture(lHandle, &struFindData);
+        switch (rc)
+        {
+            case NET_DVR_NOMOREFILE:
+                hasError = 1;
+            case NET_DVR_FILE_SUCCESS:
+            {
+                char *infoKey;
+                PyObject *payload;
+                switch (struFindData.wPicType)
+                {
+                    case 0:
+                        infoKey = "plateInfo";
+                        payload = Py_BuildValue("{s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:{s:f,s:f,s:f,s:f},s:y#}",
+                            "plateType", struFindData.uPicFeature.struPlateInfo.byPlateType,
+                            "Color", struFindData.uPicFeature.struPlateInfo.byColor,
+                            "Bright", struFindData.uPicFeature.struPlateInfo.byBright,
+                            "LicenseLen", struFindData.uPicFeature.struPlateInfo.byLicenseLen,
+                            "EntireBelieve", struFindData.uPicFeature.struPlateInfo.byEntireBelieve,
+                            "Region", struFindData.uPicFeature.struPlateInfo.byRegion,
+                            "Country", struFindData.uPicFeature.struPlateInfo.byCountry,
+                            "Area", struFindData.uPicFeature.struPlateInfo.byArea,
+                            "PlateSize", struFindData.uPicFeature.struPlateInfo.byPlateSize,
+                            "AddInfoFlag", struFindData.uPicFeature.struPlateInfo.byAddInfoFlag,
+                            "CRIndex", struFindData.uPicFeature.struPlateInfo.wCRIndex,
+                            "Rect", 
+                                "x", struFindData.uPicFeature.struPlateInfo.struPlateRect.fX,
+                                "y", struFindData.uPicFeature.struPlateInfo.struPlateRect.fY,
+                                "w", struFindData.uPicFeature.struPlateInfo.struPlateRect.fWidth,
+                                "h", struFindData.uPicFeature.struPlateInfo.struPlateRect.fHeight,
+                            "License",
+                                struFindData.uPicFeature.struPlateInfo.sLicense, strlen(struFindData.uPicFeature.struPlateInfo.sLicense)
+                        ); 
+                        break;
+                    case 1:
+                        infoKey = "faceInfo";
+                        payload = Py_BuildValue("{}");
+                        break;
+                    default:
+                        infoKey = "other";
+                        payload = Py_BuildValue("{}");
+                        break;
+                }
+                PyList_Append(list, Py_BuildValue("{s:s,s:i,s:i,s:i,s:O}",
+                    "FileName", struFindData.sFileName,
+                    "FileSize", struFindData.dwFileSize,
+                    "PicType", struFindData.wPicType,
+                    "Time", DVRTimeTotimestamp(struFindData.struTime),
+                    infoKey, payload
+                ));
+                break;
+            }
+            case NET_DVR_FILE_NOFIND:
+                return Py_BuildValue("[]");
+                break;
+            case NET_DVR_ISFINDING:
+                break;
+            case NET_DVR_FILE_EXCEPTION:
+            case -1:
+                LONG pErrorNo = NET_DVR_GetLastError();
+                sprintf(ps->error_buffer, "NET_DVR_FindNextSmartPicture error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+                PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+                
+                hasError = -1;
+                break;
+        }
+        // printf("%d: %s\n", rc, struFindData.sFileName);
+    }
+
+    if (!NET_DVR_CloseSmartSearchPicture(lHandle))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_CloseSmartSearchPicture error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        
+        return NULL;
+    }
+    return list;
 }
 
 static PyObject *getevent(PyObject *self, PyObject *args) {
@@ -1713,6 +1941,18 @@ static PyMethodDef hiknvsevent_methods[] = {
     {
         "delDVRChannel", delDVRChannel, METH_VARARGS,
         "Del DVR Channel"
+    },
+    {
+        "SmartSearchPicture", SmartSearchPicture, METH_VARARGS,
+        "Smart Search Picture"
+    },
+    {
+        "getDeviceInfo", getDeviceInfo, METH_NOARGS,
+        "Get DVR Channel Info"
+    },
+    {
+        "getPicture", getPicture, METH_VARARGS,
+        "Get Picture"
     },
     {
         "getChannelName", getChannelName, METH_VARARGS,
