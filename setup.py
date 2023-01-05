@@ -5,7 +5,7 @@ from distutils.core import setup, Extension
 import glob
 import pkgconfig
 
-d = pkgconfig.parse('libavcodec')
+d = pkgconfig.parse('libavcodec libavformat libavutil libswresample libswscale')
 
 hello_module = Extension('hikevent', sources = ['hikevent.cpp'],
                          include_dirs=d['include_dirs'] + ['include'],

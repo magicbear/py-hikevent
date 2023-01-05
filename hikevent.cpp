@@ -12,16 +12,25 @@
 #include "HCNetSDK.h"
 #include <sys/queue.h>
 #include <iconv.h>
+#include <signal.h>
 
 #include "LinuxPlayM4.h"
 #define USECOLOR 1
 
-// extern "C" { 
-// #include "libavcodec/avcodec.h"
-// #include "libavutil/common.h"
-// #include "libavutil/imgutils.h"
-// #include "libavutil/mathematics.h"
-// }
+extern "C" { 
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavformat/avio.h>
+#include <libavutil/file.h>
+#include "libswresample/swresample.h"
+#include <libavutil/frame.h>
+#include <libavutil/mem.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/samplefmt.h>
+#include <libavutil/timestamp.h>
+#include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
+}
 
 using namespace std;
 
@@ -30,6 +39,7 @@ using namespace std;
 
 #define DVR_REMOTE_CALL_COMMAND 0x4000001
 #define DVR_VIDEO_DATA          0x4000002
+#define DVR_REMOTE_CALL_STATUS  0x4000003
 
 #define sprintfDVRTime(struAlarmTime) "%04d-%02d-%02d %02d:%02d:%02d", struAlarmTime.wYear, struAlarmTime.byMonth, struAlarmTime.byDay, struAlarmTime.byHour, struAlarmTime.byMinute, struAlarmTime.bySecond
 
@@ -57,12 +67,20 @@ typedef struct {
 
     TAILQ_HEAD(tailhead, entry) head;
 
+    TAILQ_HEAD(decode_tailhead, entry) decode_head;
+
     pthread_mutex_t lock;
     NET_DVR_DEVICEINFO_V30 struDeviceInfo;
     NET_DVR_USER_LOGIN_INFO struLoginInfo = {0};
     NET_DVR_DEVICEINFO_V40 struDeviceInfoV40 = {0};
 
     LONG nPort;
+
+    int decode_way;
+
+    AVIOContext* pb = nullptr;
+    AVFormatContext *pFormatCtx = NULL;
+    pthread_t *decodeThread;
     // AVCodecContext *codec_ctx;
     // AVCodecParserContext *parser;
     // AVPacket *pkt;
@@ -74,6 +92,9 @@ typedef struct {
 struct hikevent_queue_t {
     long lCommand;
     PyHIKEvent_Object *ps;
+    struct SwsContext *sws_ctx;
+    int      video_src_linesize[4];
+    int      video_dst_linesize[4];
     LONG nPort;
     TAILQ_ENTRY(hikevent_queue_t) entries;
 };
@@ -98,6 +119,11 @@ void CALLBACK MessageCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pA
     }
 }
 
+int CALLBACK MessageCallback_V31(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pAlarmInfo, DWORD dwBufLen, void* pUser)
+{
+    MessageCallback(lCommand, pAlarmer, pAlarmInfo, dwBufLen, pUser);
+    return 0;
+}
 
 static PyObject *
 hikevent_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
@@ -107,7 +133,7 @@ hikevent_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     ps = (PyHIKEvent_Object *) type->tp_alloc(type, 0);
     if (ps == NULL) return NULL;
 
-    static char *kwlist[] = {"host", "user", "passwd", NULL};
+    static char *kwlist[] = {(char *)"host", (char *)"user", (char *)"passwd", NULL};
 
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "sss", kwlist, &ps->ip, &ps->user, &ps->passwd)) {
         PyErr_SetString(PyExc_TypeError,
@@ -116,6 +142,7 @@ hikevent_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     }
 
     TAILQ_INIT(&ps->head);
+    TAILQ_INIT(&ps->decode_head);
     if (pthread_mutex_init(&ps->lock, NULL) != 0) {
         PyErr_SetString(PyExc_TypeError, "mutex init has failed");
         return NULL;
@@ -146,6 +173,7 @@ hikevent_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         return NULL;
     }
 
+    // NET_DVR_SetDVRMessageCallBack_V31(MessageCallback_V31, (void *)ps);
     NET_DVR_SetDVRMessageCallBack_V51(0, MessageCallback, (void *)ps);
 
     struct hikevent_queue_t *elem = (struct hikevent_queue_t *)calloc(1, sizeof(struct hikevent_queue_t));
@@ -167,15 +195,20 @@ static PyObject *receiveAlarmEvent(PyObject *self, PyObject *args) {
     }
     NET_DVR_SETUPALARM_PARAM_V50 struSetupAlarmParam = { 0 };
     struSetupAlarmParam.dwSize = sizeof(struSetupAlarmParam);
-    struSetupAlarmParam.byRetVQDAlarmType = TRUE; //Prefer VQD Alarm type of NET_DVR_VQD_ALARM
-    struSetupAlarmParam.byRetAlarmTypeV40 = TRUE;   // variable size
-    struSetupAlarmParam.byLevel = 2;    // low priority
+    struSetupAlarmParam.byRetAlarmTypeV40 = 1;   // variable size
+    // struSetupAlarmParam.byLevel = 2;    // low priority
+    struSetupAlarmParam.byLevel = 0;    // high priority
+    struSetupAlarmParam.byAlarmInfoType = 1;
+    struSetupAlarmParam.byRetDevInfoVersion = 1;
+    struSetupAlarmParam.byRetVQDAlarmType = 1; //Prefer VQD Alarm type of NET_DVR_VQD_ALARM
     struSetupAlarmParam.byFaceAlarmDetection = 1;//m_comFaceAlarmType.GetCurSel();
                 
     struSetupAlarmParam.byRetDevInfoVersion = TRUE;
     struSetupAlarmParam.byAlarmInfoType = 1;
-    struSetupAlarmParam.bySupport = 4 | 8;
-    ps->lHandle = NET_DVR_SetupAlarmChan_V50(ps->lUserID, &struSetupAlarmParam, NULL, 0);
+    struSetupAlarmParam.bySupport = 1 | 2 | 8;
+    struSetupAlarmParam.byDeployType = 0;
+
+    ps->lHandle = NET_DVR_SetupAlarmChan_V50(ps->lUserID, &struSetupAlarmParam, (char *)"<SubscribeEvent version=\"2.0\" xmlns=\"http://www.isapi.org/ver20/XMLSchema\"><eventMode>all</eventMode><changedUploadSub/></SubscribeEvent> ", 0);
 
     if (ps->lHandle < 0)
     {
@@ -240,9 +273,23 @@ void CALLBACK fRemoteCallCallback(DWORD dwType, void *lpBuffer, DWORD dwBufLen, 
             TAILQ_INSERT_HEAD(&self->head, elem, entries);
             pthread_mutex_unlock(&self->lock);
         }
-        NET_DVR_VIDEO_CALL_PARAM *callParam = (NET_DVR_VIDEO_CALL_PARAM*)lpBuffer;
+        // NET_DVR_VIDEO_CALL_PARAM *callParam = (NET_DVR_VIDEO_CALL_PARAM*)lpBuffer;
+    } else if (dwType == NET_SDK_CALLBACK_TYPE_STATUS)
+    {
+        NET_SDK_CALLBACK_STATUS_NORMAL *status = (NET_SDK_CALLBACK_STATUS_NORMAL *)lpBuffer;
+        fprintf(stderr, "Receive RemoteCall Callback Event %d %d size: %d\n", dwType, *status, dwBufLen);
+        struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+        if (elem)
+        {
+            elem->lCommand = DVR_REMOTE_CALL_STATUS;
+            elem->pAlarmInfo = NULL;
+            elem->dwBufLen = *status;
+            pthread_mutex_lock(&self->lock);
+            TAILQ_INSERT_HEAD(&self->head, elem, entries);
+            pthread_mutex_unlock(&self->lock);
+        }
     } else {
-        printf("Receive RemoteCall Callback Event %d\n", dwType);
+        fprintf(stderr, "Receive RemoteCall Callback Event %d\n", dwType);
     }
 }
 
@@ -267,6 +314,27 @@ static PyObject *receiveRemoteCall(PyObject *self, PyObject *args) {
     }
 
     ps->callChannelOpened = true;
+    Py_RETURN_NONE;
+}
+
+static PyObject *stopRemoteCall(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    if (!ps->callChannelOpened)
+    {
+        Py_RETURN_NONE;
+        return NULL;
+    }
+
+    if (!NET_DVR_StopRemoteConfig(ps->lCallHandle))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_StopRemoteConfig error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+
+    ps->callChannelOpened = false;
     Py_RETURN_NONE;
 }
 
@@ -302,7 +370,6 @@ static PyObject *remoteCallCommand(PyObject *self, PyObject *args) {
 static PyObject *getDeviceInfo(PyObject *self, PyObject *args) {
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
     NET_DVR_DEV_BASE_INFO devConfig;
-    DWORD lReceivedConfigSize;
     NET_DVR_DEVICEID_INFO devInfo;
     uint32_t lpStatusList;
 
@@ -334,7 +401,7 @@ static PyObject *getDeviceInfo(PyObject *self, PyObject *args) {
     *@param outlen 存放转换后,tempoutbuf剩余的空间
     *
     * */
-    size_t ret = iconv (cvSess, &srcstart, &srclen, &tempoutbuf, &outlen);
+    int ret = iconv (cvSess, &srcstart, &srclen, &tempoutbuf, &outlen);
     if (ret == -1)
     {
         sprintf(ps->error_buffer, "iconv name to utf-8 error, %d\n", errno);
@@ -416,7 +483,7 @@ static PyObject *getChannelName(PyObject *self, PyObject *args) {
     *@param outlen 存放转换后,tempoutbuf剩余的空间
     *
     * */
-    size_t ret = iconv (cvSess, &srcstart, &srclen, &tempoutbuf, &outlen);
+    int ret = iconv (cvSess, &srcstart, &srclen, &tempoutbuf, &outlen);
     if (ret == -1)
     {
         sprintf(ps->error_buffer, "iconv name to utf-8 error, %d\n", errno);
@@ -594,7 +661,8 @@ static PyObject *sendVoice(PyObject *self, PyObject *args) {
 
     char *inputBuffer;
     Py_ssize_t bufferLength;
-    if (!PyArg_ParseTuple(args, "y#|i", &inputBuffer, &bufferLength, &ps->compressAudioType.byAudioEncType)) {
+    LONG specifiedVoiceHandler = -1;
+    if (!PyArg_ParseTuple(args, "y#|iii", &inputBuffer, &bufferLength, &ps->compressAudioType.byAudioEncType, &specifiedVoiceHandler)) {
         return NULL;
     }
 
@@ -672,7 +740,7 @@ static PyObject *sendVoice(PyObject *self, PyObject *args) {
             return NULL;
         }
         
-        if (!NET_DVR_VoiceComSendData(ps->lVoiceHandler, (char*)enc_proc_param.out_buf, enc_proc_param.out_frame_size))
+        if (!NET_DVR_VoiceComSendData(specifiedVoiceHandler != -1 ? specifiedVoiceHandler : ps->lVoiceHandler, (char*)enc_proc_param.out_buf, enc_proc_param.out_frame_size))
         {
             LONG pErrorNo = NET_DVR_GetLastError();
             sprintf(ps->error_buffer, "NET_DVR_VoiceComSendData error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
@@ -708,32 +776,18 @@ void yv12toYUV(char *outYuv, char *inYv12, int width, int height, int widthStep)
     unsigned int Y, U, V;
     int tmp;
     int idx;
-//printf("widthStep=%d.\n",widthStep);
 
     for (row = 0; row<height; row++)
     {
         idx = row * widthStep;
-        int rowptr = row*width;
-
+        // int rowptr = row*width;
 
         for (col = 0; col<width; col++)
         {
-//int colhalf=col>>1;
             tmp = (row / 2)*(width / 2) + (col / 2);
-//         if((row==1)&&( col>=1400 &&col<=1600))
-//         {
-//          printf("col=%d,row=%d,width=%d,tmp=%d.\n",col,row,width,tmp);
-//          printf("row*width+col=%d,width*height+width*height/4+tmp=%d,width*height+tmp=%d.\n",row*width+col,width*height+width*height/4+tmp,width*height+tmp);
-//         }
             Y = (unsigned int)inYv12[row*width + col];
             U = (unsigned int)inYv12[width*height + width*height / 4 + tmp];
             V = (unsigned int)inYv12[width*height + tmp];
-//         if ((col==200))
-//         {
-//         printf("col=%d,row=%d,width=%d,tmp=%d.\n",col,row,width,tmp);
-//         printf("width*height+width*height/4+tmp=%d.\n",width*height+width*height/4+tmp);
-//         return ;
-//         }
             if ((idx + col * 3 + 2)> (1200 * widthStep))
             {
 //printf("row * widthStep=%d,idx+col*3+2=%d.\n",1200 * widthStep,idx+col*3+2);
@@ -743,7 +797,6 @@ void yv12toYUV(char *outYuv, char *inYv12, int width, int height, int widthStep)
             outYuv[idx + col * 3 + 2] = V;
         }
     }
-//printf("col=%d,row=%d.\n",col,row);
 }
 
 
@@ -752,12 +805,48 @@ void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInf
     long lFrameType = pFrameInfo->nType;
     PyHIKEvent_Object *dec_ps = NULL;
     hikevent_queue_t *q;
+    struct SwsContext *sws_ctx = NULL;
+    int      video_src_linesize[4];
+    int      video_dst_linesize[4];
+    uint8_t *video_src_data[4], *video_dst_data[4];
+
+    if (lFrameType != T_YV12)
+    {
+        fprintf(stderr, "Non support frame type\n");
+        return;
+    }
 
     q = TAILQ_FIRST(&hikq_head);
     while (q != NULL) {
         if (q->ps->nPort == nPort)
         {
             dec_ps = q->ps;
+            if (q->sws_ctx == NULL)
+            {
+                q->sws_ctx = sws_getContext(pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_YUV420P,
+                             pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_RGB24,
+                             SWS_FAST_BILINEAR, NULL, NULL, NULL);
+                /* allocate image where the decoded image will be put */
+                int ret = av_image_alloc(video_src_data, q->video_src_linesize,
+                                     pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_YUV420P, 1);
+                if (ret < 0) {
+                    fprintf(stderr, "Could not allocate raw video buffer\n");
+                    return;
+                }
+                /* allocate image where the decoded image will be put */
+                ret = av_image_alloc(video_dst_data, q->video_dst_linesize,
+                                     pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_RGB24, 1);
+                if (ret < 0) {
+                    fprintf(stderr, "Could not allocate raw video buffer\n");
+                    return;
+                }
+                av_freep(&video_src_data[0]);
+                av_freep(&video_dst_data[0]);
+            }
+            sws_ctx = q->sws_ctx;
+            memcpy(video_src_linesize, q->video_src_linesize, sizeof(int) * 4);
+            memcpy(video_dst_linesize, q->video_dst_linesize, sizeof(int) * 4);
+
             break;
         }        
         
@@ -775,8 +864,15 @@ void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInf
 
         *((uint32_t *)yuvData) = pFrameInfo->nWidth;
         *((uint32_t *)yuvData+1) = pFrameInfo->nHeight;
-        yv12toYUV(yuvData + 8, pBuf, pFrameInfo->nWidth, pFrameInfo->nHeight, pFrameInfo->nWidth * 3);//nSize / pFrameInfo->nHeight);
-        // memcpy(yuvData, pBuf, nSize);
+
+        /* convert to destination format */
+        video_src_data[0] = (uint8_t*)pBuf;
+        video_src_data[1] = (uint8_t*)(pBuf + pFrameInfo->nHeight * pFrameInfo->nWidth + pFrameInfo->nHeight * pFrameInfo->nWidth / 4);
+        video_src_data[2] = (uint8_t*)(pBuf + pFrameInfo->nHeight * pFrameInfo->nWidth);
+        video_dst_data[0] = (uint8_t *)(yuvData + 8);
+        
+        sws_scale(sws_ctx, (const uint8_t * const*)video_src_data,
+                    video_src_linesize, 0, pFrameInfo->nHeight, video_dst_data, video_dst_linesize);
 
         struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
         elem->lCommand = DVR_VIDEO_DATA;
@@ -785,21 +881,361 @@ void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInf
         elem->dwBufLen = 8 + pFrameInfo->nWidth * pFrameInfo->nHeight * 3;
         memcpy(elem->pAlarmInfo, yuvData, elem->dwBufLen);
         pthread_mutex_lock(&dec_ps->lock);
-        TAILQ_INSERT_HEAD(&dec_ps->head, elem, entries);
+        TAILQ_INSERT_TAIL(&dec_ps->head, elem, entries);
         pthread_mutex_unlock(&dec_ps->lock);
     }
 }
 
+void *decode_thread(void *data)
+{
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)data;
+
+    //ffmpeg打开流的回调
+    auto onReadData = [](void* pUser, uint8_t* buf, int bufSize)->int
+    {
+        PyHIKEvent_Object *ps = (PyHIKEvent_Object *)pUser;
+
+        while (true)
+        {
+            pthread_mutex_lock(&ps->lock);
+            if (TAILQ_EMPTY(&ps->decode_head))
+            {
+                pthread_mutex_unlock(&ps->lock);
+                sleep(0.02);
+            } else 
+            {
+                struct entry *p = TAILQ_FIRST(&ps->decode_head);
+                if ((int)(p->dwBufLen - p->lCommand) < bufSize)
+                {
+                    TAILQ_REMOVE(&ps->decode_head, p, entries);
+                }
+                pthread_mutex_unlock(&ps->lock);
+                
+                size_t wsize = (int)(p->dwBufLen - p->lCommand) > bufSize ? bufSize : (int)(p->dwBufLen - p->lCommand);
+                memcpy(buf, p->pAlarmInfo + p->lCommand, wsize);
+                p->lCommand += wsize;
+                
+                if (p->dwBufLen - p->lCommand == 0)
+                {
+                    free(p->pAlarmInfo);
+                    free(p);
+                }
+                return wsize;
+            }
+
+        }
+        return 0;
+    };
+    size_t avio_ctx_buffer_size = 1024 * 1024;
+    uint8_t* avio_ctx_buffer = nullptr;
+    
+    //ffmpeg-------------------------------
+    avio_ctx_buffer = (uint8_t*)av_malloc(avio_ctx_buffer_size);
+    if (!avio_ctx_buffer)
+    {
+        fprintf(stderr, "av_malloc ctx buffer failed!");
+        return NULL;
+    }
+    ps->pb = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size, 0, ps, onReadData, NULL, NULL);
+    if (ps->pb == nullptr)  //分配空间失败
+    {
+        av_freep(&avio_ctx_buffer);
+        fprintf(stderr, "avio_alloc_context failed");
+        return NULL;
+    }
+
+    if (!(ps->pFormatCtx = avformat_alloc_context())) {
+        av_freep(&avio_ctx_buffer);
+        fprintf(stderr, "avformat_alloc_context failed");
+        return NULL;
+    }
+
+    ps->pFormatCtx->pb = ps->pb;
+
+    AVDictionary* opts = nullptr;
+    av_dict_set(&opts, "fflags", "nobuffer", 0);
+    av_dict_set(&opts, "max_analyze_duration", "10", 0);
+    av_dict_set(&opts, "max_delay", "1000", 0);
+    av_dict_set(&opts, "stimeout", "1000000", 0);
+    av_dict_set(&opts, "probesize", "4096", 0);             //加快打开
+    
+    if (avformat_open_input(&ps->pFormatCtx, NULL, NULL, &opts) < 0)
+    {
+        if (nullptr != opts)
+            av_dict_free(&opts);
+        av_freep(&avio_ctx_buffer);
+        avformat_free_context(ps->pFormatCtx);
+        fprintf(stderr, "avformat_open_input failed\n");
+        return NULL;
+    }
+    if (nullptr != opts)
+        av_dict_free(&opts);
+
+    if (avformat_find_stream_info(ps->pFormatCtx, NULL) < 0) {
+        fprintf(stderr, "Could not find stream information\n");
+        av_freep(&avio_ctx_buffer);
+        avformat_close_input(&ps->pFormatCtx);
+        avformat_free_context(ps->pFormatCtx);
+        return NULL;
+    }
+
+    int video_stream_idx = -1;
+    AVCodecContext *dec_ctx;
+    struct SwsContext *sws_ctx = NULL;
+    static uint8_t *video_src_data[4] = {NULL};
+    static int      video_src_linesize[4];
+    static int video_src_bufsize;
+
+    static uint8_t *video_dst_data[4] = {NULL};
+    static int      video_dst_linesize[4];
+    static int video_dst_bufsize;
+    AVFrame *frame;
+    AVPacket *pkt = av_packet_alloc();
+
+    int ret = av_find_best_stream(ps->pFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
+    if (ret < 0) {
+        fprintf(stderr, "Could not find %s stream\n",
+                av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+        av_freep(&avio_ctx_buffer);
+        avformat_close_input(&ps->pFormatCtx);
+        avformat_free_context(ps->pFormatCtx);
+        return NULL;
+    } else {
+        video_stream_idx = ret;
+        AVStream *st = ps->pFormatCtx->streams[ret];
+
+        /* find decoder for the stream */
+        AVCodec *dec = NULL;
+        if (st->codecpar->codec_id == AV_CODEC_ID_H264 && ps->decode_way == 2)
+        {
+            dec = avcodec_find_decoder_by_name("h264_cuvid");
+            if (dec == NULL)
+                dec = avcodec_find_decoder_by_name("h264_qsv");
+            if (dec == NULL)
+                dec = avcodec_find_decoder_by_name("h264_v4l2m2m");
+        } else if (st->codecpar->codec_id == AV_CODEC_ID_HEVC && ps->decode_way == 2)
+        {
+            dec = avcodec_find_decoder_by_name("hevc_cuvid");
+            if (dec == NULL)
+                dec = avcodec_find_decoder_by_name("hevc_qsv");
+            if (dec == NULL)
+                dec = avcodec_find_decoder_by_name("hevc_v4l2m2m");
+        }
+        if (dec == NULL) {
+           dec = avcodec_find_decoder(st->codecpar->codec_id);
+        }
+        if (!dec) {
+            fprintf(stderr, "Failed to find %s codec\n",
+                    av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+            av_freep(&avio_ctx_buffer);
+            return NULL;
+        }
+
+        fprintf(stderr, "Decode video using %s -> %s\n", dec->name, dec->long_name);
+
+        dec_ctx = avcodec_alloc_context3(dec);
+        if (!dec_ctx) {
+            fprintf(stderr, "Failed to allocate the %s codec context\n",
+                    av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+            av_freep(&avio_ctx_buffer);
+            return NULL;
+        }
+
+        /* Copy codec parameters from input stream to output codec context */
+        if ((ret = avcodec_parameters_to_context(dec_ctx, st->codecpar)) < 0) {
+            fprintf(stderr, "Failed to copy %s codec parameters to decoder context\n",
+                    av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+            av_freep(&avio_ctx_buffer);
+            return NULL;
+        }
+
+        /* Init the decoders */
+        if ((ret = avcodec_open2(dec_ctx, dec, &opts)) < 0) {
+            fprintf(stderr, "Failed to open %s codec\n",
+                    av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+            av_freep(&avio_ctx_buffer);
+            return NULL;
+        }
+
+        if (dec_ctx->width == 0 || dec_ctx->height == 0)
+        {
+            fprintf(stderr, "invalid video buffer\n");
+            avcodec_free_context(&dec_ctx);
+            av_freep(&avio_ctx_buffer);
+            return NULL;
+        }
+
+        /* allocate image where the decoded image will be put */
+        ret = av_image_alloc(video_src_data, video_src_linesize,
+                             dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt, 1);
+        if (ret < 0) {
+            fprintf(stderr, "Could not allocate raw video buffer\n");
+            avcodec_free_context(&dec_ctx);
+            av_freep(&avio_ctx_buffer);
+            return NULL;
+        }
+        video_src_bufsize = ret;
+        if (dec_ctx->pix_fmt != AV_PIX_FMT_RGB24)
+        {
+            sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+                             dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24,
+                             SWS_FAST_BILINEAR, NULL, NULL, NULL);
+            if (!sws_ctx) {
+                fprintf(stderr,
+                        "Impossible to create scale context for the conversion "
+                        "fmt:%s -> fmt:%s\n",
+                        av_get_pix_fmt_name(dec_ctx->pix_fmt), 
+                        av_get_pix_fmt_name(AV_PIX_FMT_RGB24));
+                avcodec_free_context(&dec_ctx);
+                av_freep(&avio_ctx_buffer);
+                return NULL;
+            }
+
+            /* buffer is going to be written to rawvideo file, no alignment */
+            if ((ret = av_image_alloc(video_dst_data, video_dst_linesize,
+                                      dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24, 1)) < 0) {
+                fprintf(stderr, "Could not allocate destination image\n");
+                avcodec_free_context(&dec_ctx);
+                sws_freeContext(sws_ctx);
+                av_freep(&avio_ctx_buffer);
+                return NULL;
+            }
+            video_dst_bufsize = ret;
+        }
+    }
+
+    av_dump_format(ps->pFormatCtx, 0, NULL, 0);
+
+    frame = av_frame_alloc();
+    if (!frame) {
+        fprintf(stderr, "Could not allocate video frame\n");
+        goto end;
+    }
+
+    while (true)
+    {
+        int iRet = av_read_frame(ps->pFormatCtx, pkt);
+        //3-检查处理视频 处理重连机制
+        if (iRet < 0)
+        {
+            if (iRet == AVERROR_EOF || !ps->pFormatCtx->pb || avio_feof(ps->pFormatCtx->pb) || ps->pFormatCtx->pb->error)
+            {
+                fprintf(stderr, "Error\n");
+                av_packet_free(&pkt);
+                goto end;
+            }
+            continue;
+        }
+        if (pkt->stream_index != video_stream_idx)
+        {
+            av_packet_unref(pkt);
+            continue;
+        }
+        // submit the packet to the decoder
+        int ret = avcodec_send_packet(dec_ctx, pkt);
+        if (ret < 0) {
+            fprintf(stderr, "Error submitting a packet for decoding\n");
+            goto end;
+        }
+        // get all the available frames from the decoder
+        while (ret >= 0) {
+            ret = avcodec_receive_frame(dec_ctx, frame);
+            if (ret < 0) {
+                // those two return values are special and mean there is no output
+                // frame available, but there were no errors during decoding
+                if (ret == AVERROR_EOF)
+                {
+                    fprintf(stderr, "Video Decode EOF\n");
+                    goto end;
+                }
+                if (ret == AVERROR(EAGAIN))
+                    break;
+
+                fprintf(stderr, "Error during decoding\n");
+                goto end;
+            }
+
+            // write the frame data to output file
+            if (dec_ctx->codec->type == AVMEDIA_TYPE_VIDEO)
+            {
+                size_t video_bufsize;
+                uint8_t *video_data;
+                if (sws_ctx == NULL)
+                {
+                    video_bufsize = video_src_bufsize;
+                    av_image_copy(video_src_data, video_src_linesize,
+                      (const uint8_t **)(frame->data), frame->linesize,
+                      dec_ctx->pix_fmt, dec_ctx->width, dec_ctx->height);
+                    video_data = video_src_data[0];
+                } else 
+                {
+                    video_bufsize = video_dst_bufsize;
+                    av_image_copy(video_src_data, video_src_linesize,
+                        (const uint8_t **)(frame->data), frame->linesize,
+                        dec_ctx->pix_fmt, dec_ctx->width, dec_ctx->height);
+                    /* convert to destination format */
+                    sws_scale(sws_ctx, (const uint8_t * const*)video_src_data,
+                              video_src_linesize, 0, dec_ctx->height, video_dst_data, video_dst_linesize);
+                    video_data = video_dst_data[0];
+                }
+
+                struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+                elem->lCommand = DVR_VIDEO_DATA;
+                // elem->pAlarmInfo = yuvData;
+                elem->pAlarmInfo = (char *)malloc(video_bufsize + 8);
+                elem->dwBufLen = 8 + video_bufsize;
+                *((uint32_t *)elem->pAlarmInfo) = dec_ctx->width;
+                *((uint32_t *)elem->pAlarmInfo+1) = dec_ctx->height;
+                memcpy(elem->pAlarmInfo + 8, video_data, video_bufsize);
+                pthread_mutex_lock(&ps->lock);
+                TAILQ_INSERT_TAIL(&ps->head, elem, entries);
+                pthread_mutex_unlock(&ps->lock);
+            }
+
+            av_frame_unref(frame);
+            if (ret < 0)
+            {
+                fprintf(stderr, "error\n");
+                goto end;
+            }
+        }
+
+    }
+end:
+    if (pkt)
+        av_packet_free(&pkt);
+    if (frame)
+        av_frame_free(&frame);
+    if (dec_ctx)
+        avcodec_free_context(&dec_ctx);
+    if (sws_ctx)
+        sws_freeContext(sws_ctx);
+
+    av_freep(&video_src_data[0]);
+    av_freep(&video_dst_data[0]);
+    if (ps->pb)
+    {
+        if (ps->pb->buffer)
+            av_freep(&ps->pb->buffer);
+        avio_context_free(&ps->pb);
+    }
+    if (ps->pFormatCtx)
+    {
+        avformat_close_input(&ps->pFormatCtx);
+        // avformat_free_context(ps->pFormatCtx);
+    }
+    return NULL;
+}
+
 void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *pBuffer,DWORD dwBufSize,void* dwUser) {
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)dwUser;
-    int ret ;
 
     switch (dwDataType) {
         case NET_DVR_SYSHEAD: //系统头
-            if (!PlayM4_GetPort(&ps->nPort))
-                break;
-            if (dwBufSize > 0)
+            if (dwBufSize > 0 && ps->decode_way == 0)
             {
+                if (!PlayM4_GetPort(&ps->nPort))
+                    break;
                 if (!PlayM4_OpenStream(ps->nPort, pBuffer, dwBufSize, 1024 * 1024))
                 {
                     fprintf(stderr,"Error: PlayM4_OpenStream %d\n", PlayM4_GetLastError(ps->nPort));
@@ -808,53 +1244,57 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 {
                     fprintf(stderr,"Error: PlayM4_SetDecCallback %d\n", PlayM4_GetLastError(ps->nPort));
                 }
-                if (!PlayM4_Play(ps->nPort, NULL))
+                if (!PlayM4_Play(ps->nPort, 0))
                 {
                     fprintf(stderr,"Error: PlayM4_Play %d\n", PlayM4_GetLastError(ps->nPort));
+                }
+            } else if (ps->decode_way > 0)
+            {
+                struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+                if (elem)
+                {
+                    elem->lCommand = 0;
+                    elem->pAlarmInfo = (char *)malloc(dwBufSize);
+                    memcpy(elem->pAlarmInfo, pBuffer, dwBufSize);
+                    elem->dwBufLen = dwBufSize;
+                    pthread_mutex_lock(&ps->lock);
+                    TAILQ_INSERT_TAIL(&ps->decode_head, elem, entries);
+                    pthread_mutex_unlock(&ps->lock);
                 }
             }
             break;
         case NET_DVR_STREAMDATA: //码流数据
-            if (dwBufSize > 0 && ps->nPort != -1) {
+            if (dwBufSize > 0 && ps->nPort != -1 && ps->decode_way == 0) {
                 BOOL inData = PlayM4_InputData(ps->nPort, pBuffer, dwBufSize);
                 while (!inData)
                 {
                     inData = PlayM4_InputData(ps->nPort, pBuffer, dwBufSize);
-
                 }
-                // ret = av_parser_parse2(ps->parser, ps->codec_ctx, &ps->pkt->data, &ps->pkt->size,
-                //                        pBuffer, dwBufSize, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
-                // if (ret < 0) {
-                //     fprintf(stderr, "Error while parsing\n");
-                //     exit(1);
-                // }
-                // if (ps->pkt->size > 0)
-                // {
-                //     ret = avcodec_send_packet(ps->codec_ctx, ps->pkt);
-                //     if (ret < 0) {
-                //         fprintf(stderr, "Error sending a packet for decoding\n");
-                //         // exit(1);
-                //     }
-                //     while (ret >= 0)
-                //     {
-                //         ret = avcodec_receive_frame(ps->codec_ctx, ps->frame);
-                //         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-                //             return;
-                //         else if (ret < 0) {
-                //             fprintf(stderr, "Error during decoding\n");
-                //             exit(1);
-                //         }
+            } else if (dwBufSize > 0 && ps->decode_way > 0) {
+                if (ps->decodeThread == NULL)
+                {
+                    ps->decodeThread = (pthread_t *)calloc(sizeof(pthread_t), 1);
+                    pthread_create(ps->decodeThread, NULL, decode_thread, ps);
+                }
 
-                //         printf("saving frame %3d\n", ps->codec_ctx->frame_number);
-                //         fflush(stdout);
-
-                //     }
-                // }
+                struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+                if (elem)
+                {
+                    elem->lCommand = 0;
+                    elem->pAlarmInfo = (char *)malloc(dwBufSize);
+                    memcpy(elem->pAlarmInfo, pBuffer, dwBufSize);
+                    elem->dwBufLen = dwBufSize;
+                    pthread_mutex_lock(&ps->lock);
+                    TAILQ_INSERT_TAIL(&ps->decode_head, elem, entries);
+                    pthread_mutex_unlock(&ps->lock);
+                }
             }
             // printf("NET_DVR_SYSHEAD data,the size is %ld,%d.\n", time(NULL), dwBufSize);
             break; 
+        case NET_DVR_AUDIOSTREAMDATA:   // 音频数据
+            break;
         default: //其他数据
-            printf("Other data,the size is %ld,%d.\n", time(NULL), dwBufSize);
+            fprintf(stderr, "Other data,the size is %ld,%d.\n", time(NULL), dwBufSize);
             break;
     }
 }
@@ -864,62 +1304,17 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
 
     long cameraNo;
     long streamType = 0;
-    if (!PyArg_ParseTuple(args, "I|I", &cameraNo, &streamType)) {
+    ps->decode_way = 0;
+    if (!PyArg_ParseTuple(args, "I|II", &cameraNo, &streamType, &ps->decode_way)) {
         return NULL;
     }
+    struct entry *np = NULL;
 
-    // avcodec_register_all();
-
-    // AVPacket *pkt = av_packet_alloc();
-    // if (!pkt)
-    // {
-    //     sprintf(ps->error_buffer, "av_packet_alloc error\n");
-    //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
-        
-    //     return NULL;
-    // }
-
-    // /* find the MPEG-1 video decoder */
-    // const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
-    // if (!codec) {
-    //     sprintf(ps->error_buffer, "codec not found\n");
-    //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
-        
-    //     return NULL;
-    // }
-
-    // AVCodecParserContext *parser = av_parser_init(codec->id);
-    // if (!parser) {
-    //     sprintf(ps->error_buffer, "parser not found\n");
-    //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
-        
-    //     return NULL;
-    // }
-    // AVCodecContext *c= NULL;
-    // AVFrame *picture;
-    // c = avcodec_alloc_context3(codec);
-    // picture = av_frame_alloc();
-
-    // /* For some codecs, such as msmpeg4 and mpeg4, width and height
-    //    MUST be initialized there because this information is not
-    //    available in the bitstream. */
-
-    // /* For some codecs, such as msmpeg4 and mpeg4, width and height
-    //    MUST be initialized there because this information is not
-    //    available in the bitstream. */
-
-    // /* open it */
-    // if (avcodec_open2(c, codec, NULL) < 0) {
-    //     sprintf(ps->error_buffer, "could not open codec\n");
-    //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
-        
-    //     return NULL;
-    // }
-
-    // ps->parser = parser;
-    // ps->codec_ctx = c;
-    // ps->pkt = pkt;
-    // ps->frame = picture;
+    while (NULL != (np = TAILQ_FIRST(&ps->decode_head))) {
+        TAILQ_REMOVE(&ps->decode_head, np, entries);
+        free(np->pAlarmInfo);
+        free(np);
+    }
 
     NET_DVR_PREVIEWINFO struPlayInfo = {0};
     struPlayInfo.hPlayWnd     = 0;  // 仅取流不解码。这是Linux写法，Windows写法是struPlayInfo.hPlayWnd = NULL;
@@ -957,6 +1352,15 @@ static PyObject *stopRealPlay(PyObject *self, PyObject *args) {
         
         return NULL;
     }
+
+    if (ps->decodeThread)
+    {
+        if (ESRCH == pthread_kill(*ps->decodeThread, 0))
+        {
+            ps->decodeThread = NULL;
+        }
+    }
+
     Py_RETURN_NONE;
 }
 
@@ -1032,7 +1436,7 @@ static PyObject *ptzPreset(PyObject *self, PyObject *args) {
     LONG lChannelNo;
     DWORD dwPresetIndex;
     DWORD dwPTZPresetCmd = GOTO_PRESET;
-    if (!PyArg_ParseTuple(args, "II|pI", &lChannelNo, &dwPresetIndex, &dwPTZPresetCmd)) {
+    if (!PyArg_ParseTuple(args, "II|I", &lChannelNo, &dwPresetIndex, &dwPTZPresetCmd)) {
         return NULL;
     }
     if (dwPTZPresetCmd != GOTO_PRESET && dwPTZPresetCmd != SET_PRESET && dwPTZPresetCmd != CLE_PRESET)
@@ -1051,6 +1455,44 @@ static PyObject *ptzPreset(PyObject *self, PyObject *args) {
         return NULL;
     }
     Py_RETURN_NONE;
+}
+
+static PyObject *ISAPI(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    NET_DVR_XML_CONFIG_INPUT inputParam;
+    NET_DVR_XML_CONFIG_OUTPUT outputParam;
+
+    memset(&inputParam, 0, sizeof(NET_DVR_XML_CONFIG_INPUT));
+    inputParam.dwSize = sizeof(NET_DVR_XML_CONFIG_INPUT);
+    
+    memset(&outputParam, 0, sizeof(NET_DVR_XML_CONFIG_OUTPUT));
+    outputParam.dwSize = sizeof(NET_DVR_XML_CONFIG_OUTPUT);
+
+    if (!PyArg_ParseTuple(args, "s#|s#", &inputParam.lpRequestUrl, &inputParam.dwRequestUrlLen, &inputParam.lpInBuffer, &inputParam.dwInBufferSize)) {
+        sprintf(ps->error_buffer, "input params invalid.\n");
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+    outputParam.dwOutBufferSize = 1048576 * 32;    // 32 MB
+    outputParam.lpOutBuffer = malloc(outputParam.dwOutBufferSize);
+    outputParam.dwStatusSize = 1048576;    // 1 MB
+    outputParam.lpStatusBuffer = malloc(outputParam.dwStatusSize);
+    if (!NET_DVR_STDXMLConfig(ps->lUserID, &inputParam, &outputParam))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_STDXMLConfig error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        free(outputParam.lpStatusBuffer);
+        free(outputParam.lpOutBuffer);
+
+        return NULL;
+    }
+    PyObject *rc = Py_BuildValue("{s:s,s:s#}", "status", outputParam.lpStatusBuffer, "result", outputParam.lpOutBuffer,
+        outputParam.dwReturnedXMLSize);
+    free(outputParam.lpStatusBuffer);
+    free(outputParam.lpOutBuffer);
+    return rc;
 }
 
 NET_DVR_TIME_EX timestampToDVRTime(const time_t t)
@@ -1122,7 +1564,7 @@ static PyObject *SmartSearchPicture(PyObject *self, PyObject *args) {
                 hasError = 1;
             case NET_DVR_FILE_SUCCESS:
             {
-                char *infoKey;
+                const char *infoKey;
                 PyObject *payload;
                 switch (struFindData.wPicType)
                 {
@@ -1228,6 +1670,14 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                     "RoomNumber", callParam->wRoomNumber);
                 break;
             }
+            case DVR_REMOTE_CALL_STATUS:
+            {
+                command = "DVR_REMOTE_CALL_STATUS";
+
+                payload = Py_BuildValue("{s:i}",
+                    "status", p->dwBufLen);
+                break;                
+            }
             case DVR_VIDEO_DATA:   // 自定义事件 -> DVR_REMOTE_CALL_COMMAND
                 command = "DVR_VIDEO_DATA";
 
@@ -1276,7 +1726,7 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                     NET_VCA_DEV_INFO *dev = &struAlarmInfo.struDevInfo;
                     NET_VCA_HUMAN_FEATURE *human = &struAlarmInfo.struFeature;
 
-                    const char *pBuffer1 = (p->pAlarmInfo+offsetof(NET_VCA_FACESNAP_RESULT, pBuffer1));
+                    // const char *pBuffer1 = (p->pAlarmInfo+offsetof(NET_VCA_FACESNAP_RESULT, pBuffer1));
                     // printf("%.*s\n", struAlarmInfo.dwFacePicLen, pBuffer1);
                     payload = Py_BuildValue("{s:s,s:i,s:{s:s,s:i,s:i,s:i},s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i}", //,s:f,s:f,s:O}",
                             "StorageIP", struAlarmInfo.sStorageIP,
@@ -1560,6 +2010,14 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
             case COMM_ITS_GATE_ALARMINFO: // 出入口控制机数据 -> NET_DVR_GATE_ALARMINFO
             {
                     command="COMM_ITS_GATE_ALARMINFO";
+                    NET_DVR_GATE_ALARMINFO *pAlarmInfo = (NET_DVR_GATE_ALARMINFO *)p->pAlarmInfo;
+                    static char alarmTime[48];
+                    sprintf(alarmTime, "%04d-%02d-%02d %02d:%02d:%02d", pAlarmInfo->struAlarmTime.wYear, pAlarmInfo->struAlarmTime.byMonth, pAlarmInfo->struAlarmTime.byDay, pAlarmInfo->struAlarmTime.byHour, pAlarmInfo->struAlarmTime.byMinute, pAlarmInfo->struAlarmTime.bySecond);
+
+                    payload = Py_BuildValue("{s:i,s:i,s:i,s:s}", "alarmType", pAlarmInfo->byAlarmType, 
+                        "externalDevType", pAlarmInfo->byExternalDevType,
+                        "externalDevStatus", pAlarmInfo->byExternalDevStatus,
+                        "alarmTime", alarmTime);
                     break;
             }
             case COMM_GATE_CHARGEINFO_UPLOAD: // 出入口付费信息 -> NET_DVR_GATE_CHARGEINFO
@@ -1635,6 +2093,14 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
             case COMM_ALARM: // 移动侦测、视频丢失、遮挡、IO信号量等报警信息(V3.0以下版本支持的设备) -> NET_DVR_ALARMINFO
             {
                     command="COMM_ALARM";
+                    NET_DVR_ALARMINFO *pAlarmInfo = (NET_DVR_ALARMINFO *)p->pAlarmInfo;
+
+                    payload = Py_BuildValue("{s:i,s:i,s:i,s:y#,s:y#,s:y#,s:y#}", "alarmType", pAlarmInfo->dwAlarmType, 
+                        "alarmInputNumber", pAlarmInfo->dwAlarmInputNumber,
+                        "alarmOutputNumber", pAlarmInfo->dwAlarmOutputNumber, MAX_ALARMOUT * sizeof(DWORD),
+                        "alarmRelateChannel", pAlarmInfo->dwAlarmRelateChannel, MAX_CHANNUM * sizeof(DWORD),
+                        "channel", pAlarmInfo->dwChannel, MAX_CHANNUM * sizeof(DWORD),
+                        "diskNumber", pAlarmInfo->dwDiskNumber, MAX_DISKNUM * sizeof(DWORD));
                     break;
             }
             case COMM_ALARM_V30: // 移动侦测、视频丢失、遮挡、IO信号量等报警信息(V3.0以上版本支持的设备) -> NET_DVR_ALARMINFO_V30
@@ -1649,8 +2115,8 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                     memcpy(&struAlarmInfo, p->pAlarmInfo, sizeof(NET_DVR_ALARMINFO_V40));
 
                     // // 0-信号量报警，1-硬盘满，2-信号丢失，3-移动侦测，4-硬盘未格式化，5-写硬盘出错，6-遮挡报警，7-制式不匹配，8-非法访问，9-视频信号异常，10-录像异常，11-智能场景变化，12-阵列异常，13-前端/录像分辨率不匹配，15-智能侦测，16-POE供电异常，17-录播主机报警，18-TME语音对讲请求报警，23-脉冲报警，24-人脸库硬盘异常，25-人脸库变更，26-人脸库图片变更
-                    static char alarmTime[24];
-                    sprintf(alarmTime, "%04d-%02d-%02d %02d:%02d:%02d.%03d", struAlarmInfo.struAlarmFixedHeader.struAlarmTime.wYear, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byMonth, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byDay, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byHour, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byMinute, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.bySecond, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byRes);
+                    static char alarmTime[48];
+                    sprintf(alarmTime, "%04d-%02d-%02d %02d:%02d:%02d", struAlarmInfo.struAlarmFixedHeader.struAlarmTime.wYear, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byMonth, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byDay, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byHour, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.byMinute, struAlarmInfo.struAlarmFixedHeader.struAlarmTime.bySecond);
                     switch (struAlarmInfo.struAlarmFixedHeader.dwAlarmType)
                     {
                         case 0:
@@ -1734,7 +2200,7 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                     NET_DVR_ACS_ALARM_INFO *acsAlarm = (NET_DVR_ACS_ALARM_INFO *)p->pAlarmInfo;
                     NET_DVR_ACS_EVENT_INFO *acsEvent = (NET_DVR_ACS_EVENT_INFO *)&acsAlarm->struAcsEventInfo;
 
-                    static char alarmTime[24];
+                    static char alarmTime[48];
                     sprintf(alarmTime, "%04d-%02d-%02d %02d:%02d:%02d", acsAlarm->struTime.dwYear, acsAlarm->struTime.dwMonth, acsAlarm->struTime.dwDay, acsAlarm->struTime.dwHour, acsAlarm->struTime.dwMinute, acsAlarm->struTime.dwSecond);
                     static char cardNo[ACS_CARD_NO_LEN * 2];
                     for (int i = 0; i < ACS_CARD_NO_LEN; i++)
@@ -1826,6 +2292,16 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                     command="COMM_PANORAMIC_LINKAGE_ALARM";
                     break;
             }
+            default:
+            {
+                char tcommand[128];
+                sprintf(tcommand, "UNKNOW command: %lx", p->lCommand);
+                PyObject *arglist = Py_BuildValue("{s:s,s:i,s:O}", "command", tcommand, "size", p->dwBufLen);
+                
+                free(p->pAlarmInfo);
+                free(p);
+                return arglist;
+            }
         }
         PyObject *arglist = Py_BuildValue("{s:s,s:i,s:O}", "command", command, "size", p->dwBufLen, "payload", payload);
         Py_DECREF(payload);
@@ -1844,10 +2320,16 @@ static void release(PyObject *self) {
     struct hikevent_queue_t *np, *q = NULL;
 
     TAILQ_FOREACH(np, &hikq_head, entries)
+    {
         if (np->ps == ps)
             q = np;
+    }
     if (q != NULL)
+    {
         TAILQ_REMOVE(&hikq_head, q, entries);
+        sws_freeContext(q->sws_ctx);
+        free(q);
+    }
 
     if (ps->lVoiceHandler > 0)
     {
@@ -1919,6 +2401,10 @@ static PyMethodDef hiknvsevent_methods[] = {
         "Receive Remote Call"
     },
     {
+        "stopRemoteCall", stopRemoteCall, METH_NOARGS,
+        "Stop Receive Remote Call"
+    },
+    {
         "remoteCallCommand", remoteCallCommand, METH_VARARGS,
         "Remote Call Command"
     },
@@ -1973,6 +2459,10 @@ static PyMethodDef hiknvsevent_methods[] = {
     {
         "ptzPreset", ptzPreset, METH_VARARGS,
         "PTZ Preset"
+    },
+    {
+        "ISAPI", ISAPI, METH_VARARGS,
+        "ISAPI Command"
     },
     {NULL, NULL, 0, NULL}
 };
