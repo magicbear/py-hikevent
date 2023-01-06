@@ -586,7 +586,6 @@ int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st)
     switch (ps->compressAudioType.byAudioEncType)
     {
     case 0: // Note: Not support
-        dp->g722_decoder = NET_DVR_InitG722Decoder();
     case 9:
         dp->ps->transcode = -1;
         // st->codecpar->codec_id = AV_CODEC_ID_ADPCM_G722;
@@ -1340,8 +1339,6 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                                 return;
 
                             NET_DVR_AUDIODEC_PROCESS_PARAM decodeParam;
-                            // decodeParam.in_buf = input_packet->buf->data + 64;
-                            // decodeParam.in_data_size = input_packet->buf->size - 64;
                             decodeParam.in_buf = (unsigned char *)pBuffer + 16;
                             decodeParam.in_data_size = 80;
                             decodeParam.dec_info.nchans = 1;
@@ -1363,141 +1360,9 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                                 TAILQ_INSERT_TAIL(&ps->push_head, elem, entries);
                                 pthread_mutex_unlock(&ps->lock);
                             }
-                //                 elem->bType = 0;
-                //                 elem->data = (char *)malloc(decodeParam.out_frame_size + 16);
-                //                 psm->psm_length = htons(decodeParam.out_frame_size + 10);
-                //                 memcpy(elem->data, pBuffer, 16);
-                //                 memcpy(elem->data + 16, decodeParam.out_buf, decodeParam.out_frame_size);
-                //                 elem->dwBufLen = 16 + decodeParam.out_frame_size;
-                                
-                //                 dump_hex((unsigned char *)elem->data, elem->dwBufLen);
-
-                //                 unsigned char *pOffset = pBuffer + 6 + 3;
-                //                 // https://blog.csdn.net/donglicaiju76152/article/details/124823760
-                //                 if (pes_head->PTS_DTS_flags == 2)
-                //                 {
-                //                     pOffset += 10;
-                //                     // 5 bytes of DTS
-                //                 } else if (pes_head->PTS_DTS_flags == 3)
-                //                 {
-                //                     pOffset += 10;
-                //                     // 5 bytes of DTS
-                //                     // 5 bytes of PTS
-                //                 }
-                //                 if (pes_head->ESCR_flag == 3)
-                //                 {
-                //                     pOffset += 8;
-                //                     // 48 bit
-                //                     // reserved                // 2  bslbf
-                //                     // ESCR_base[32..30]       // 3  bslbf
-                //                     // marker_bit              // 1  bslbf
-                //                     // ESCR_base[29..15]       // 15 bslbf
-                //                     // marker_bit              // 1  bslbf
-                //                     // ESCR_base[14..0]        // 15 bslbf
-                //                     // marker_bit              // 1  bslbf
-                //                     // ESCR_extension          // 9  bslbf
-                //                     // marker_bit              // 1  bslbf
-                //                 }
-                //                 if (pes_head->ESCR_flag == 1)
-                //                 {
-                //                     pOffset += 4;
-                //                     // 24 bit
-                //                     // marker_bit              // 1  bslbf
-                //                     // ES_rate                 // 22 bslbf
-                //                     // marker_bit              // 1  bslbf
-                //                 }
-                //                 if (pes_head->DSM_trick_mode_flag) {
-                //                     pOffset += 1;
-                //                     // 8 bit
-                //                     // trick_mode_control      // 3  bslbf
-                //                     // if (trick_mode_control == fast_forward) {
-                //                         // field_id            // 2  bslbf
-                //                         // intra_slice_refresh // 1  bslbf
-                //                         // frequency_truncation// 2  bslbf
-                //                     // } else if (trick_mode_control == slow_motion) {
-                //                         // rep_cntrl           // 5  bslbf
-                //                     // } else if (trick_mode_control == freeze_frame) {
-                //                         // field_id            // 2  bslbf
-                //                         // reserved            // 3  bslbf
-                //                     // } else if (trick_mode_control == fast_reverse) {
-                //                         // field_id            // 2  bslbf
-                //                         // intra_slice_refresh // 1  bslbf
-                //                         // frequency_truncation// 2  bslbf
-                //                     // } else if (trick_mode_control == slow_reverse) {
-                //                         // rep_cntrl           // 5  bslbf
-                //                     // } else {
-                //                         // reserved            // 5  bslbf
-                //                     // }
-                //                 }
-                //                 if (pes_head->additional_copy_info_flag) {
-                //                     pOffset += 1;
-                //                     // marker_bit              // 1  bslbf
-                //                     // additional_copy_info    // 7  bslbf
-                //                 }
-                //                 if (pes_head->PES_CRC_flag) {
-                //                     pOffset += 2;
-                //                     // previous_PES_packet_CRC // 16 bslbf
-                //                 }
-                //                 if (pes_head->PES_extension_flag) {
-                //                     mpeg_pes_extension_t *pes_ext = (mpeg_pes_extension_t *)pOffset;
-                //                     pOffset += 1;
-                //                     if (pes_ext->PES_private_data_flag == '1') {
-                //                         pOffset += 16;
-                //                         // PES_private_data    // 128 bslbf
-                //                     }
-                //                     if (pes_ext->pack_header_field_flag == '1') {
-                //                         printf("pack_field_length = %d\n", pOffset);
-                //                         pOffset += 1;
-                //                            // 8  bslbf
-                //                         // pack_header()
-                //                     }
-                //                     if (pes_ext->program_packet_sequence_counter_flag == '1') {
-                //                         pOffset += 2;
-                //                         // marker_bit             // 1  bslbf
-                //                         // program_packet_sequence_counter // 7  bslbf
-                //                         // marker_bit             // 1  bslbf
-                //                         // MPEG1_MPEG2_identifier // 1  bslbf
-                //                         // original_stuff_length  // 6  bslbf
-                //                     }
-                //                     if (pes_ext->P_STD_buffer_flag == '1') {
-                //                         pOffset += 2;
-                //                         // '01'                // 2  bslbf
-                //                         // P-STD_buffer_scale  // 1  bslbf
-                //                         // P-STD_buffer_size   // 13 bslbf
-                //                     }
-                //                     if (pes_ext->PES_extension_flag_2 == '1') {
-                //                         int PES_extension_field_length = pOffset[0] & 0x7F;
-
-                //                         pOffset += 1 + PES_extension_field_length;
-
-                //                         printf("PES_extension_field_length = %d\n", PES_extension_field_length);
-                //                         // marker_bit          // 1  bslbf
-                //                         // PES_extension_field_length // 7  bslbf
-                //                         // for (i=0; i < PES_extension_field_length; i++) {
-                //                         //     reserved        // 8  bslbf
-                //                         // }
-                //                     }
-                //                 }
-                //                 printf("psm_stream_info_len = %d  ESCR_flag = %d\n", psm->psm_stream_info_len, pOffset - pBuffer);
-                // fwrite(elem->data, elem->dwBufLen, 1, fp);
-                // fflush(fp);
-                //                 pthread_mutex_lock(&ps->lock);
-                //                 TAILQ_INSERT_TAIL(&ps->decode_head, elem, entries);
-                //                 pthread_mutex_unlock(&ps->lock);
-                //             }
-                            // av_frame_free(&frame);
 
                             break;
-                            // input_frame->nb_samples *= 8;
-                            // 
-                            // printf("samples = %d  buf size = %d line size: %d\n", );
-
                         }
-                    // {
-                    //     unsigned short stream_map_length = htons(*(uint16_t *)(pBuffer + sizeof(program_stream_map_t) + psm->psm_stream_info_len));
-                    //     // printf("rx audio psm_length: %d psm_stream_info_len: %d  stream_map_length: %d data size %d\n",
-                    //     //     htons(psm->psm_length), psm->psm_stream_info_len, stream_map_length, dwBufSize);
-                    // }
                     case 0xba:  // PSH Header
                     case 0xe0:  // Video
                     {
@@ -1649,6 +1514,12 @@ int main(int argc, char **argv)
         LONG pErrorNo = NET_DVR_GetLastError();
         fprintf(stderr, "NET_DVR_GetCurrentAudioCompress error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
         return pErrorNo;
+    }
+
+    if (ps->compressAudioType.byAudioEncType == 0)
+    {
+        // Require G722 Decoder
+        dp->g722_decoder = NET_DVR_InitG722Decoder();
     }
 
     // NET_DVR_XML_CONFIG_INPUT inputParam;
