@@ -9,4 +9,10 @@ ln -s CH-HCNetSDKV6.1.6.45_build20210302_linux64/lib ./
 ./build.sh
 ```
 
+hikrtmp: Hikvision RTMP Push tool.
+requirement: libav-dev
+```
+make
+```
+
 enjoy it
