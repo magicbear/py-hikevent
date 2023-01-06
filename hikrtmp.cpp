@@ -1255,7 +1255,6 @@ void dump_hex(unsigned char *buf, DWORD len)
 void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *pBuffer,DWORD dwBufSize,void* dwUser) {
     HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)dwUser;
     HIKEvent_Object *ps = dp->ps;
-        static FILE *fp = fopen("test.ps", "wb");
     // int dRet;
 
     switch (dwDataType) {
@@ -1280,8 +1279,6 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
             pthread_mutex_lock(&ps->lock);
             TAILQ_INSERT_TAIL(&ps->decode_head, elem, entries);
             pthread_mutex_unlock(&ps->lock);
-                fwrite(elem->data, elem->dwBufLen, 1, fp);
-                fflush(fp);
             break;
         }
         case NET_DVR_STREAMDATA: //码流数据
