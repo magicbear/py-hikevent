@@ -51,7 +51,7 @@ char        STREAM_AUDIO_CODEC[256] = {0};
 int  		cameraNo;
 int 		streamType;
 
-static const char *shortopts = ":h:u:p:c:s:N";
+static const char *shortopts = ":h:u:p:c:s:Nv";
 
 static struct option longopts[] = {
   {"host",          1, 0, 'h'},
@@ -60,6 +60,7 @@ static struct option longopts[] = {
   {"camera",        1, 0, 'c'},
   {"stream-type",   1, 0, 's'},
   {"ignore-acodec", 0, 0, 'N'},
+  {"verbose",       0, 0, 'v'},
 
   {0, 0, 0, 0}
 };
@@ -93,6 +94,7 @@ typedef struct {
     NET_DVR_DEVICEINFO_V40 struDeviceInfoV40 = {0};
 
     int transcode;
+    int debug_packet;
 
     uint32_t rx_size;
     uint32_t tx_size;
@@ -808,7 +810,8 @@ void *process_thread(void *data)
                     goto end;
                 }
             }
-            // log_packet(pFormatCtx, pkt, 0);
+            if (ps->debug_packet)
+                log_packet(pFormatCtx, pkt, 0);
             /* copy packet */
             av_packet_rescale_ts(pkt, in_stream->time_base, dp->out_vstream->time_base);
             if (dp->video_pts)
@@ -820,7 +823,8 @@ void *process_thread(void *data)
             pkt->stream_index = out_stream->index;
 
             ps->tx_size += pkt->buf ? pkt->buf->size : 0;
-            // log_packet(ps->plivectx, pkt, 1);
+            if (ps->debug_packet)
+                log_packet(ps->plivectx, pkt, 1);
             ret = av_interleaved_write_frame(ps->plivectx, pkt);
             if (ret < 0) {
                 fprintf(stderr, "Error muxing packet %s\n", av_err2str(ret));
@@ -845,7 +849,8 @@ void *process_thread(void *data)
                 {
                     if (read_decode_convert_and_store(dp, pkt, &dst_nb_samples, &finished))
                         goto end;
-                    // log_packet(pFormatCtx, pkt, 0);
+                    if (ps->debug_packet)
+                        log_packet(pFormatCtx, pkt, 0);
                     av_packet_unref(pkt);
                     av_packet_free(&pkt);
                 } else 
@@ -921,6 +926,8 @@ void *process_thread(void *data)
                         av_frame_free(&output_frame);
                         goto end;
                     }
+                    if (ps->debug_packet)
+                        log_packet(pFormatCtx, output_packet, 0);
                     if (data_written)
                     {
                         output_packet->pos = -1;
@@ -1156,9 +1163,6 @@ void *decode_thread(void *data)
 end:
     // if (pkt)
     //     av_packet_free(&pkt);
-    if (dp->g722_decoder)
-        NET_DVR_ReleaseG722Decoder(dp->g722_decoder);
-
     if (pb)
     {
         if (pb->buffer)
@@ -1429,6 +1433,9 @@ int main(int argc, char **argv)
         case 'N':
             ps->transcode = 0;
             break;
+        case 'v':
+            ps->debug_packet = 1;
+            break;
         case '?': // 输入未定义的选项, 都会将该选项的值变为 ?
             fprintf(stderr,"unknown option \n");
             break;
@@ -1519,7 +1526,7 @@ int main(int argc, char **argv)
     if (ps->compressAudioType.byAudioEncType == 0)
     {
         // Require G722 Decoder
-        dp->g722_decoder = NET_DVR_InitG722Decoder();
+        ps->decthread_ctx->g722_decoder = NET_DVR_InitG722Decoder();
     }
 
     // NET_DVR_XML_CONFIG_INPUT inputParam;
@@ -1582,6 +1589,13 @@ int main(int argc, char **argv)
         }
         usleep(100000);   // wait 100ms
     }
+    if (false == NET_DVR_StopRealPlay(lRealPlayHandle)) {    // 停止取流
+        LONG pErrorNo = NET_DVR_GetLastError();
+        fprintf(stderr, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        NET_DVR_Cleanup();
+        return 1;
+    }
+
     if (ps->plivectx && ps->decthread_ctx->outputHeaderWrite)
         av_write_trailer(ps->plivectx);
 
@@ -1589,12 +1603,8 @@ int main(int argc, char **argv)
         avio_closep(&ps->plivectx->pb);
     avformat_free_context(ps->plivectx);
 
-    if (false == NET_DVR_StopRealPlay(lRealPlayHandle)) {    // 停止取流
-        LONG pErrorNo = NET_DVR_GetLastError();
-        fprintf(stderr, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
-        NET_DVR_Cleanup();
-        return 1;
-    }
+    if (ps->decthread_ctx->g722_decoder)
+        NET_DVR_ReleaseG722Decoder(ps->decthread_ctx->g722_decoder);
 
 	return 0;
 }
