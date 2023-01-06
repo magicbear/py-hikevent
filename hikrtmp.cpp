@@ -51,7 +51,7 @@ char        STREAM_AUDIO_CODEC[256] = {0};
 int  		cameraNo;
 int 		streamType;
 
-static const char *shortopts = ":h:u:p:c:s:Nv";
+static const char *shortopts = ":h:u:p:c:s:Nv?";
 
 static struct option longopts[] = {
   {"host",          1, 0, 'h'},
@@ -61,6 +61,7 @@ static struct option longopts[] = {
   {"stream-type",   1, 0, 's'},
   {"ignore-acodec", 0, 0, 'N'},
   {"verbose",       0, 0, 'v'},
+  {"help",          0, 0, '?'},
 
   {0, 0, 0, 0}
 };
@@ -1437,7 +1438,19 @@ int main(int argc, char **argv)
             ps->debug_packet = 1;
             break;
         case '?': // 输入未定义的选项, 都会将该选项的值变为 ?
-            fprintf(stderr,"unknown option \n");
+            fprintf(stderr, "Usage: hikrtmp -h <host> -u <user> -p <passwd> -c <camera channel> [-s <stream type>] [-Nvh] <rtmp url>\n");
+            fprintf(stderr, "Convert Hikvision PS stream to RTMP\n");
+            fprintf(stderr, "  \n");
+            fprintf(stderr, "Options:\n");
+            fprintf(stderr, "  -h --host            NVR/DVR/Camera IP\n");
+            fprintf(stderr, "  -u --user            NVR/DVR/Camera Username\n");
+            fprintf(stderr, "  -p --passwd          NVR/DVR/Camera Password\n");
+            fprintf(stderr, "  -c --camera          NVR/DVR/Camera Camera Channel\n");
+            fprintf(stderr, "  -s --stream-type     NVR/DVR/Camera Stream Type (0: Main Stream 1: Sub Stream...)\n");
+            fprintf(stderr, "  -N --ignore-acodec   Copy acodec without transcode to AAC\n");
+            fprintf(stderr, "  -v --verbose         Log frames\n");
+            fprintf(stderr, "  -? --help            Show help\n\n");
+            // fprintf(stderr,"unknown option \n");
             break;
         default:
             fprintf(stderr, "Unimplemented option -- %c\n", c);
