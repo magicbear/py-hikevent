@@ -71,8 +71,9 @@ void intHandler(int dummy) {
 }
 
 struct entry {
-    long lCommand;
+    int bType;
     char *data;
+    int start;
     size_t dwBufLen;
     TAILQ_ENTRY(entry) entries;
 };
@@ -110,6 +111,7 @@ typedef struct {
 typedef struct HIKEvent_DecodeThread {
     HIKEvent_Object *ps;
     pthread_t thread;
+    pthread_t process_thread;
     AVStream *out_vstream;
     AVStream *out_astream;
 
@@ -127,6 +129,7 @@ typedef struct HIKEvent_DecodeThread {
     AVCodecContext *enc_ctx;
     SwrContext *swr;
     AVAudioFifo *fifo;
+    void *g722_decoder;
     bool outputHeaderWrite;
     bool probedone;
 } HIKEvent_DecodeThread;
@@ -351,6 +354,48 @@ static int convert_samples(const uint8_t **input_data,
 }
 
 
+static int convert_and_store(HIKEvent_DecodeThread *dp,
+                                         AVFrame *input_frame,
+                                         int *dst_nb_samples,
+                                         int *finished)
+{
+    /* Temporary storage for the converted input samples. */
+    uint8_t **converted_input_samples = NULL;
+    int ret = AVERROR_EXIT;
+
+    /* If there is decoded data, convert and store it. */
+    /* compute the number of converted samples: buffering is avoided
+     * ensuring that the output buffer will contain at least all the
+     * converted input samples */
+    *dst_nb_samples =
+        av_rescale_rnd(input_frame->nb_samples, dp->dst_rate, dp->src_rate, AV_ROUND_UP);
+
+    /* Initialize the temporary storage for the converted input samples. */
+    if (init_converted_samples(&converted_input_samples, dp->enc_ctx,
+                               *dst_nb_samples))
+        goto cleanup;
+
+    /* Convert the input samples to the desired output sample format.
+     * This requires a temporary storage provided by converted_input_samples. */
+    if (convert_samples((const uint8_t**)input_frame->extended_data, converted_input_samples,
+                        input_frame->nb_samples, *dst_nb_samples, dp->swr))
+        goto cleanup;
+
+    /* Add the converted input samples to the FIFO buffer for later processing. */
+    if (add_samples_to_fifo(dp->fifo, converted_input_samples,
+                            *dst_nb_samples))
+        goto cleanup;
+    ret = 0;
+
+cleanup:
+    if (converted_input_samples) {
+        av_freep(&converted_input_samples[0]);
+        free(converted_input_samples);
+    }
+
+    return ret;
+}
+
 /**
  * Read one audio frame from the input file, decode, convert and store
  * it in the FIFO buffer.
@@ -368,18 +413,12 @@ static int convert_samples(const uint8_t **input_data,
  * @return Error code (0 if successful)
  */
 static int read_decode_convert_and_store(HIKEvent_DecodeThread *dp,
-                                         AVAudioFifo *fifo,
                                          AVPacket *input_packet,
-                                         AVCodecContext *input_codec_context,
-                                         AVCodecContext *output_codec_context,
-                                         SwrContext *resampler_context,
                                          int *dst_nb_samples,
                                          int *finished)
 {
     /* Temporary storage of the input samples of the frame read from the file. */
     AVFrame *input_frame = NULL;
-    /* Temporary storage for the converted input samples. */
-    uint8_t **converted_input_samples = NULL;
     int data_present = 0;
     int ret = AVERROR_EXIT;
 
@@ -388,7 +427,7 @@ static int read_decode_convert_and_store(HIKEvent_DecodeThread *dp,
         goto cleanup;
     /* Decode one frame worth of audio samples. */
     if (decode_audio_frame(input_frame, input_packet,
-                           input_codec_context, &data_present, finished))
+                           dp->dec_ctx, &data_present, finished))
         goto cleanup;
     /* If we are at the end of the file and there are no more samples
      * in the decoder which are delayed, we are actually finished.
@@ -399,36 +438,11 @@ static int read_decode_convert_and_store(HIKEvent_DecodeThread *dp,
     }
     /* If there is decoded data, convert and store it. */
     if (data_present) {
-        /* compute the number of converted samples: buffering is avoided
-         * ensuring that the output buffer will contain at least all the
-         * converted input samples */
-        *dst_nb_samples =
-            av_rescale_rnd(input_frame->nb_samples, dp->dst_rate, dp->src_rate, AV_ROUND_UP);
-
-        /* Initialize the temporary storage for the converted input samples. */
-        if (init_converted_samples(&converted_input_samples, output_codec_context,
-                                   *dst_nb_samples))
-            goto cleanup;
-
-        /* Convert the input samples to the desired output sample format.
-         * This requires a temporary storage provided by converted_input_samples. */
-        if (convert_samples((const uint8_t**)input_frame->extended_data, converted_input_samples,
-                            input_frame->nb_samples, *dst_nb_samples, resampler_context))
-            goto cleanup;
-
-        /* Add the converted input samples to the FIFO buffer for later processing. */
-        if (add_samples_to_fifo(fifo, converted_input_samples,
-                                *dst_nb_samples))
-            goto cleanup;
-        ret = 0;
+        ret = convert_and_store(dp, input_frame, dst_nb_samples, finished);
     }
     ret = 0;
 
 cleanup:
-    if (converted_input_samples) {
-        av_freep(&converted_input_samples[0]);
-        free(converted_input_samples);
-    }
     av_frame_free(&input_frame);
 
     return ret;
@@ -571,9 +585,14 @@ int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st)
     }
     switch (ps->compressAudioType.byAudioEncType)
     {
-    case 0: 
+    case 0: // Note: Not support
+        dp->g722_decoder = NET_DVR_InitG722Decoder();
     case 9:
-        st->codecpar->codec_id = AV_CODEC_ID_ADPCM_G722; break;
+        dp->ps->transcode = -1;
+        // st->codecpar->codec_id = AV_CODEC_ID_ADPCM_G722;
+        sampleRate = 16000;
+        st->codecpar->codec_id = AV_CODEC_ID_PCM_S16LE;
+        break;
     case 1: st->codecpar->codec_id = AV_CODEC_ID_PCM_MULAW; break;
     case 2: st->codecpar->codec_id = AV_CODEC_ID_PCM_ALAW; break;
     case 5: st->codecpar->codec_id = AV_CODEC_ID_MP2; break;
@@ -650,7 +669,7 @@ int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st)
         dp->swr = swr_alloc();
         av_opt_set_int(dp->swr, "in_channel_layout",  av_get_default_channel_layout(dp->dec_ctx->channels), 0);
         av_opt_set_int(dp->swr, "out_channel_layout", av_get_default_channel_layout(dp->enc_ctx->channels),  0);
-        av_opt_set_int(dp->swr, "in_sample_rate",     dp->dec_ctx->sample_rate, 0);
+        av_opt_set_int(dp->swr, "in_sample_rate",     dp->src_rate, 0);
         av_opt_set_int(dp->swr, "out_sample_rate",    dp->enc_ctx->sample_rate, 0);
         av_opt_set_sample_fmt(dp->swr, "in_sample_fmt",  dp->dec_ctx->sample_fmt, 0);
         av_opt_set_sample_fmt(dp->swr, "out_sample_fmt", dp->enc_ctx->sample_fmt,  0);
@@ -733,13 +752,231 @@ end:
     return ret;
 }
 
+void *process_thread(void *data)
+{
+    HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)data;
+    HIKEvent_Object *ps = (HIKEvent_Object *)dp->ps;
+    AVPacket *output_packet = NULL;
+    int ret = 0;
+    int bType = 0;
+
+    while (keepRunning)
+    {
+        AVPacket *pkt = NULL;
+        pthread_mutex_lock(&ps->lock);
+        if (TAILQ_EMPTY(&ps->push_head) || !dp->probedone)
+        {
+            pthread_mutex_unlock(&ps->lock);
+            usleep(1000);
+            continue;
+        } else 
+        {
+            struct entry *p = NULL;
+            p = TAILQ_FIRST(&ps->push_head);
+            bType = p->bType;
+            pkt = (AVPacket *)p->data;
+            TAILQ_REMOVE(&ps->push_head, p, entries);
+            pthread_mutex_unlock(&ps->lock);
+            free(p);
+        }
+
+        AVFormatContext *pFormatCtx = dp->pFormatCtx;
+        AVStream *in_stream = NULL;
+
+        if (bType == 0)
+        {
+            in_stream = pFormatCtx->streams[pkt->stream_index];
+        } else 
+        {
+            in_stream = pFormatCtx->streams[1];
+        }
+        if (in_stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+        {
+            AVStream *out_stream = dp->out_vstream;
+            // if (dp->out_astream == NULL)
+            // {
+            //     printf("waiting audio pts = %ld \n", pkt->pts);
+            //     av_packet_unref(pkt);
+            //     av_packet_free(&pkt);
+            //     continue;
+            // }
+            if (!dp->outputHeaderWrite)
+            {
+                dp->outputHeaderWrite = true;
+                ret = avformat_write_header(ps->plivectx, NULL);
+                if (ret < 0) {
+                    fprintf(stderr, "Error occurred when opening output file\n");
+                    goto end;
+                }
+            }
+            // log_packet(pFormatCtx, pkt, 0);
+            /* copy packet */
+            av_packet_rescale_ts(pkt, in_stream->time_base, dp->out_vstream->time_base);
+            if (dp->video_pts)
+            {
+                pkt->pts += dp->video_pts;
+            }
+            dp->global_pts = pkt->pts;
+            pkt->pos = -1;
+            pkt->stream_index = out_stream->index;
+
+            ps->tx_size += pkt->buf ? pkt->buf->size : 0;
+            // log_packet(ps->plivectx, pkt, 1);
+            ret = av_interleaved_write_frame(ps->plivectx, pkt);
+            if (ret < 0) {
+                fprintf(stderr, "Error muxing packet %s\n", av_err2str(ret));
+                break;
+            }
+            av_packet_unref(pkt);
+            av_packet_free(&pkt);
+        } else if (in_stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+        {
+            if (dp->out_astream == NULL && init_audio_decoder(dp, in_stream))
+            {
+                break;
+            }
+            int finished                = 0;
+            int dst_nb_samples          = 0;
+
+            if (dp->ps->transcode)
+            {
+                /* Decode one frame worth of audio samples, convert it to the
+                     * output sample format and put it into the FIFO buffer. */
+                if (bType == 0)
+                {
+                    if (read_decode_convert_and_store(dp, pkt, &dst_nb_samples, &finished))
+                        goto end;
+                    // log_packet(pFormatCtx, pkt, 0);
+                    av_packet_unref(pkt);
+                    av_packet_free(&pkt);
+                } else 
+                {
+                    AVFrame *frame = (AVFrame *)pkt;
+                    if (convert_and_store(dp, frame, &dst_nb_samples, &finished))
+                        goto end;
+                    av_frame_free(&frame);
+                }
+                
+                if (dp->audio_pts == 0)
+                {
+                    if (dp->global_pts)
+                    {
+                        dp->audio_pts = av_rescale_q_rnd(dp->global_pts, dp->out_vstream->time_base, dp->enc_ctx->time_base, AV_ROUND_UP);
+                    } else 
+                    {
+                        // Wait global pts, cache the audio frame to FIFO queue
+                        // dp->audio_pts = av_rescale_q_rnd(pkt->pts, in_stream->time_base, dp->enc_ctx->time_base, AV_ROUND_UP);
+                        continue;
+                    }
+                }
+                /* Use the encoder's desired frame size for processing. */
+                // 
+                const int output_frame_size = dp->enc_ctx->frame_size == 0 ? dst_nb_samples : dp->enc_ctx->frame_size;
+
+                /* Make sure that there is one frame worth of samples in the FIFO
+                 * buffer so that the encoder can do its work.
+                 * Since the decoder's and the encoder's frame size may differ, we
+                 * need to FIFO buffer to store as many frames worth of input samples
+                 * that they make up at least one frame worth of output samples. */
+                if (av_audio_fifo_size(dp->fifo) < output_frame_size) {
+                    /* If we are at the end of the input file, we continue
+                     * encoding the remaining audio samples to the output file. */
+                    if (finished)
+                        break;
+                }
+
+                /* If we have enough samples for the encoder, we encode them.
+                 * At the end of the file, we pass the remaining samples to
+                 * the encoder. */
+                while (av_audio_fifo_size(dp->fifo) >= output_frame_size ||
+                       (finished && av_audio_fifo_size(dp->fifo) > 0))
+                {
+                    if (!keepRunning)
+                        break;
+                    /* Temporary storage of the output samples of the frame written to the file. */
+                    AVFrame *output_frame;
+
+                    /* Use the maximum number of possible samples per frame.
+                     * If there is less than the maximum possible frame size in the FIFO
+                     * buffer use this number. Otherwise, use the maximum possible frame size. */
+                    const int frame_size = FFMIN(av_audio_fifo_size(dp->fifo),
+                                                 output_frame_size);
+                    int data_written;
+
+                    /* Initialize temporary storage for one output frame. */
+                    if (init_output_frame(&output_frame, dp->enc_ctx, frame_size))
+                        goto end;
+
+                    /* Read as many samples from the FIFO buffer as required to fill the frame.
+                     * The samples are stored in the frame temporarily. */
+                    if (av_audio_fifo_read(dp->fifo, (void **)output_frame->data, frame_size) < frame_size) {
+                        fprintf(stderr, "Could not read data from FIFO\n");
+                        av_frame_free(&output_frame);
+                        goto end;
+                    }
+
+                    output_packet = av_packet_alloc();
+                    /* Encode one frame worth of audio samples. */
+                    if (encode_audio_frame(dp, output_frame, &output_packet,
+                                           dp->enc_ctx, &data_written)) {
+                        av_frame_free(&output_frame);
+                        goto end;
+                    }
+                    if (data_written)
+                    {
+                        output_packet->pos = -1;
+                        output_packet->stream_index = dp->out_astream->index;
+
+                        // Translate Encode timebase to outstream timebase
+                        av_packet_rescale_ts(output_packet, dp->enc_ctx->time_base, dp->out_astream->time_base);
+
+                        // log_packet(ps->plivectx, output_packet, 1);
+                        ret = av_interleaved_write_frame(ps->plivectx, output_packet);
+                        if (ret < 0) {
+                            fprintf(stderr, "Error muxing packet\n");
+                            goto end;
+                        }
+                        av_packet_unref(output_packet);
+                        av_packet_free(&output_packet);
+                    }
+                    av_frame_free(&output_frame);
+                }
+            } else 
+            {
+                log_packet(pFormatCtx, pkt, 0);
+
+                av_packet_rescale_ts(pkt,
+                                     in_stream->time_base,
+                                     dp->out_astream->time_base);
+                pkt->pos = -1;
+                pkt->stream_index = dp->out_astream->index;
+
+                ps->tx_size += pkt->buf ? pkt->buf->size : 0;
+                // log_packet(ps->plivectx, pkt, 1);
+                int ret = av_interleaved_write_frame(ps->plivectx, pkt);
+                if (ret < 0) {
+                    fprintf(stderr, "Error muxing packet\n");
+                    break;
+                }
+                av_packet_unref(pkt);
+                av_packet_free(&pkt);
+            }
+        } else 
+        {
+            av_packet_unref(pkt);
+            av_packet_free(&pkt);
+        }
+    }
+end:
+    return NULL;
+}
+
 void *decode_thread(void *data)
 {
     HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)data;
     HIKEvent_Object *ps = (HIKEvent_Object *)dp->ps;
     AVIOContext *pb = nullptr;
     AVFormatContext *pFormatCtx = NULL;
-    AVPacket *output_packet = av_packet_alloc();
 
     //ffmpeg打开流的回调
     auto onReadData = [](void* pUser, uint8_t* buf, int bufSize)->int
@@ -747,27 +984,27 @@ void *decode_thread(void *data)
         HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)pUser;
         HIKEvent_Object *ps = dp->ps;
 
-        while (keepRunning)
+        while (keepRunning && ESRCH != pthread_kill(ps->decthread_ctx->process_thread, 0))
         {
             pthread_mutex_lock(&ps->lock);
             if (TAILQ_EMPTY(&ps->decode_head))
             {
                 pthread_mutex_unlock(&ps->lock);
-                sleep(0.02);
+                usleep(1000);   // wait 1ms
             } else 
             {
                 struct entry *p = TAILQ_FIRST(&ps->decode_head);
-                if ((int)(p->dwBufLen - p->lCommand) < bufSize)
+                if ((int)(p->dwBufLen - p->start) < bufSize)
                 {
                     TAILQ_REMOVE(&ps->decode_head, p, entries);
                 }
                 pthread_mutex_unlock(&ps->lock);
+
+                size_t wsize = (int)(p->dwBufLen - p->start) > bufSize ? bufSize : (int)(p->dwBufLen - p->start);
+                memcpy(buf, p->data + p->start, wsize);
+                p->start += wsize;
                 
-                size_t wsize = (int)(p->dwBufLen - p->lCommand) > bufSize ? bufSize : (int)(p->dwBufLen - p->lCommand);
-                memcpy(buf, p->data + p->lCommand, wsize);
-                p->lCommand += wsize;
-                
-                if (p->dwBufLen - p->lCommand == 0)
+                if (p->dwBufLen - p->start == 0)
                 {
                     free(p->data);
                     free(p);
@@ -834,7 +1071,6 @@ void *decode_thread(void *data)
         return NULL;
     }
 
-    AVFrame *frame = NULL;
     int ret;
 
     ret = av_find_best_stream(pFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
@@ -876,14 +1112,10 @@ void *decode_thread(void *data)
     } else {
         AVStream *st = pFormatCtx->streams[ret];
 
-        if (init_audio_decoder(dp, st))
-            return NULL;
-
-        /* frame containing input raw audio */
-        frame = av_frame_alloc();
-        if (!frame) {
-            fprintf(stderr, "Could not allocate audio frame\n");
-            goto end;
+        if (dp->out_astream == NULL)
+        {
+            if (init_audio_decoder(dp, st))
+                return NULL;
         }
     }
 
@@ -891,197 +1123,43 @@ void *decode_thread(void *data)
 
     while (keepRunning)
     {
-        AVPacket *pkt = av_packet_alloc();
+        AVPacket *pkt = NULL;
+
+        pkt = av_packet_alloc();
         int iRet = av_read_frame(pFormatCtx, pkt);
         //3-检查处理视频 处理重连机制
         if (iRet < 0)
         {
             if (iRet == AVERROR_EOF || !pFormatCtx->pb || avio_feof(pFormatCtx->pb) || pFormatCtx->pb->error)
             {
-                fprintf(stderr, "Error\n");
+                fprintf(stderr, "Error av_read_frame : %s\n", av_err2str(iRet));
+                av_packet_unref(pkt);
                 av_packet_free(&pkt);
                 goto end;
             }
+            usleep(1000);   // wait 1ms
+            av_packet_unref(pkt);
+            av_packet_free(&pkt);
             continue;
         }
-        AVStream *in_stream = pFormatCtx->streams[pkt->stream_index];
-        if (in_stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+
+        struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+        if (elem)
         {
-            AVStream *out_stream = dp->out_vstream;
-            // if (dp->out_astream == NULL)
-            // {
-            //     printf("waiting audio pts = %ld \n", pkt->pts);
-            //     av_packet_unref(pkt);
-            //     av_packet_free(&pkt);
-            //     continue;
-            // }
-            if (!dp->outputHeaderWrite)
-            {
-                dp->outputHeaderWrite = true;
-                ret = avformat_write_header(ps->plivectx, NULL);
-                if (ret < 0) {
-                    fprintf(stderr, "Error occurred when opening output file\n");
-                    goto end;
-                }
-            }
-            // log_packet(pFormatCtx, pkt, 0);
-            /* copy packet */
-            av_packet_rescale_ts(pkt, in_stream->time_base, dp->out_vstream->time_base);
-            if (dp->video_pts)
-            {
-                pkt->pts += dp->video_pts;
-            }
-            dp->global_pts = pkt->pts;
-            pkt->pos = -1;
-            pkt->stream_index = out_stream->index;
-
-            ps->tx_size += pkt->buf ? pkt->buf->size : 0;
-            // log_packet(ps->plivectx, pkt, 1);
-            ret = av_interleaved_write_frame(ps->plivectx, pkt);
-            if (ret < 0) {
-                fprintf(stderr, "Error muxing packet\n");
-                break;
-            }
-            av_packet_unref(pkt);
-            av_packet_free(&pkt);
-        } else if (in_stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-        {
-            if (dp->out_astream == NULL)
-            {
-                init_audio_decoder(dp, in_stream);
-            }
-            int finished                = 0;
-            int dst_nb_samples          = 0;
-
-            // log_packet(pFormatCtx, pkt, 0);
-
-            if (dp->ps->transcode)
-            {
-                /* Decode one frame worth of audio samples, convert it to the
-                     * output sample format and put it into the FIFO buffer. */
-                if (read_decode_convert_and_store(dp,
-                                                  dp->fifo, pkt,
-                                                  dp->dec_ctx,
-                                                  dp->enc_ctx,
-                                                  dp->swr, &dst_nb_samples, &finished))
-                    goto end;
-
-                if (dp->audio_pts == 0)
-                {
-                    if (dp->global_pts)
-                    {
-                        dp->audio_pts = av_rescale_q_rnd(dp->global_pts, dp->out_vstream->time_base, dp->enc_ctx->time_base, AV_ROUND_UP);
-                    } else 
-                    {
-                        // Wait global pts, cache the audio frame to FIFO queue
-                        // dp->audio_pts = av_rescale_q_rnd(pkt->pts, in_stream->time_base, dp->enc_ctx->time_base, AV_ROUND_UP);
-                        continue;
-                    }
-                }
-                /* Use the encoder's desired frame size for processing. */
-                // 
-                const int output_frame_size = dp->enc_ctx->frame_size == 0 ? dst_nb_samples : dp->enc_ctx->frame_size;
-
-                /* Make sure that there is one frame worth of samples in the FIFO
-                 * buffer so that the encoder can do its work.
-                 * Since the decoder's and the encoder's frame size may differ, we
-                 * need to FIFO buffer to store as many frames worth of input samples
-                 * that they make up at least one frame worth of output samples. */
-                if (av_audio_fifo_size(dp->fifo) < output_frame_size) {
-                    /* If we are at the end of the input file, we continue
-                     * encoding the remaining audio samples to the output file. */
-                    if (finished)
-                        break;
-                }
-
-                /* If we have enough samples for the encoder, we encode them.
-                 * At the end of the file, we pass the remaining samples to
-                 * the encoder. */
-                while (av_audio_fifo_size(dp->fifo) >= output_frame_size ||
-                       (finished && av_audio_fifo_size(dp->fifo) > 0))
-                {
-                    if (!keepRunning)
-                        break;
-                    /* Temporary storage of the output samples of the frame written to the file. */
-                    AVFrame *output_frame;
-
-                    /* Use the maximum number of possible samples per frame.
-                     * If there is less than the maximum possible frame size in the FIFO
-                     * buffer use this number. Otherwise, use the maximum possible frame size. */
-                    const int frame_size = FFMIN(av_audio_fifo_size(dp->fifo),
-                                                 output_frame_size);
-                    int data_written;
-
-                    /* Initialize temporary storage for one output frame. */
-                    if (init_output_frame(&output_frame, dp->enc_ctx, frame_size))
-                        goto end;
-
-                    /* Read as many samples from the FIFO buffer as required to fill the frame.
-                     * The samples are stored in the frame temporarily. */
-                    if (av_audio_fifo_read(dp->fifo, (void **)output_frame->data, frame_size) < frame_size) {
-                        fprintf(stderr, "Could not read data from FIFO\n");
-                        av_frame_free(&output_frame);
-                        goto end;
-                    }
-
-                    /* Encode one frame worth of audio samples. */
-                    if (encode_audio_frame(dp, output_frame, &output_packet,
-                                           dp->enc_ctx, &data_written)) {
-                        av_frame_free(&output_frame);
-                        goto end;
-                    }
-                    if (data_written)
-                    {
-                        output_packet->pos = -1;
-                        output_packet->stream_index = dp->out_astream->index;
-
-                        // Translate Encode timebase to outstream timebase
-                        av_packet_rescale_ts(output_packet, dp->enc_ctx->time_base, dp->out_astream->time_base);
-
-                        // log_packet(ps->plivectx, output_packet, 1);
-                        ret = av_interleaved_write_frame(ps->plivectx, output_packet);
-                        if (ret < 0) {
-                            fprintf(stderr, "Error muxing packet\n");
-                            goto end;
-                        }
-                        av_packet_unref(output_packet);
-                        av_packet_free(&output_packet);
-                    }
-                    av_frame_free(&output_frame);
-                }
-                av_packet_unref(pkt);
-                av_packet_free(&pkt);   
-            } else 
-            {
-                av_packet_rescale_ts(pkt,
-                                     in_stream->time_base,
-                                     dp->out_astream->time_base);
-                pkt->pos = -1;
-                pkt->stream_index = dp->out_astream->index;
-
-                ps->tx_size += pkt->buf ? pkt->buf->size : 0;
-                // log_packet(ps->plivectx, pkt, 1);
-                int ret = av_interleaved_write_frame(ps->plivectx, pkt);
-                if (ret < 0) {
-                    fprintf(stderr, "Error muxing packet\n");
-                    break;
-                }
-                av_packet_unref(pkt);
-                av_packet_free(&pkt);
-            }
-        } else 
-        {
-            av_packet_unref(pkt);
-            av_packet_free(&pkt);
+            elem->bType = 0;
+            elem->data = (char *)pkt;
+            elem->dwBufLen = 0;
+            pthread_mutex_lock(&ps->lock);
+            TAILQ_INSERT_TAIL(&ps->push_head, elem, entries);
+            pthread_mutex_unlock(&ps->lock);
         }
-
     }
 end:
     // if (pkt)
     //     av_packet_free(&pkt);
-    if (frame)
-        av_frame_free(&frame);
-    
+    if (dp->g722_decoder)
+        NET_DVR_ReleaseG722Decoder(dp->g722_decoder);
+
     if (pb)
     {
         if (pb->buffer)
@@ -1129,9 +1207,51 @@ typedef struct
     unsigned char psm_stream_info_len;
 } __attribute__ ((packed)) mpeg_psm_head_t;
 
+typedef struct
+{
+    unsigned reserved1                     :2;     // always 10
+    unsigned transport_scrambling_control  :2;     // 加扰控制
+    unsigned priority                      :1;
+    unsigned data_locate                   :1;
+    unsigned copyright                     :1;
+    unsigned original_or_copy              :1;
+
+    unsigned PTS_DTS_flags                 :2;
+    unsigned ESCR_flag                     :1;
+    unsigned ES_rate_flag                  :1;
+    unsigned DSM_trick_mode_flag           :1;
+    unsigned additional_copy_info_flag     :1;
+    unsigned PES_CRC_flag                  :1;
+    unsigned PES_extension_flag            :1;
+
+    unsigned char PES_header_data_length;
+} __attribute__ ((packed)) mpeg_pes_head_t;
+
+typedef struct {
+    unsigned PES_private_data_flag              :1;
+    unsigned pack_header_field_flag             :1;
+    unsigned program_packet_sequence_counter_flag :1;
+    unsigned P_STD_buffer_flag       :1;
+    unsigned reserved                :3;
+    unsigned PES_extension_flag_2    :1;
+} __attribute__ ((packed)) mpeg_pes_extension_t;
+
+void dump_hex(unsigned char *buf, DWORD len)
+{
+    for (DWORD i = 0; i < len; i++) {
+        if (i % 16 == 0)
+        {
+            printf("\n%08x: ", i);
+        }
+        printf("%02x ", buf[i]);
+    }
+        printf("\n");
+}
+
 void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *pBuffer,DWORD dwBufSize,void* dwUser) {
     HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)dwUser;
     HIKEvent_Object *ps = dp->ps;
+        static FILE *fp = fopen("test.ps", "wb");
     // int dRet;
 
     switch (dwDataType) {
@@ -1150,12 +1270,14 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
             elem->data = (char *)malloc(dwBufSize);
             buf = elem->data;
 
-            elem->lCommand = 0;
+            elem->bType = 0;
             memcpy(buf, pBuffer, dwBufSize);
             elem->dwBufLen += dwBufSize;
             pthread_mutex_lock(&ps->lock);
             TAILQ_INSERT_TAIL(&ps->decode_head, elem, entries);
             pthread_mutex_unlock(&ps->lock);
+                fwrite(elem->data, elem->dwBufLen, 1, fp);
+                fflush(fp);
             break;
         }
         case NET_DVR_STREAMDATA: //码流数据
@@ -1167,8 +1289,10 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 {
                     case 0xc0:  // Audio
                         // printf("[audio] raw: size = %d\n", dwBufSize);
+                        // for (DWORD i = 0; i < dwBufSize; i++) printf("%02x ", pBuffer[i]);
+                        //     printf("\n");
 
-                        // break;
+                        break;
                     case 0xe0:  // Video
                         // printf("[video] raw: size = %d\n", dwBufSize);
                         // break;
@@ -1189,6 +1313,186 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 switch (psm->map_stream_id)
                 {
                     case 0xc0:  // Audio
+                        ps->rx_size += dwBufSize;
+                        if (dp->ps->transcode == -1 && dwBufSize == 96)
+                        {
+                            mpeg_pes_head_t *pes_head = (mpeg_pes_head_t *)(pBuffer + 6);
+
+                            /* frame containing input raw audio */
+                            AVFrame *frame = av_frame_alloc();
+                            if (!frame) {
+                                fprintf(stderr, "Could not allocate audio frame\n");
+                                return ;
+                            }
+
+                            frame->nb_samples     = 640;
+                            frame->format         = AV_SAMPLE_FMT_S16;
+                            frame->channel_layout = av_get_default_channel_layout(1);
+
+                            /* allocate the data buffers */
+                            int ret = av_frame_get_buffer(frame, 0);
+                            if (ret < 0) {
+                                fprintf(stderr, "Could not allocate audio data buffers\n");
+                                return;
+                            }
+                            ret = av_frame_make_writable(frame);
+                            if (ret < 0)
+                                return;
+
+                            NET_DVR_AUDIODEC_PROCESS_PARAM decodeParam;
+                            // decodeParam.in_buf = input_packet->buf->data + 64;
+                            // decodeParam.in_data_size = input_packet->buf->size - 64;
+                            decodeParam.in_buf = (unsigned char *)pBuffer + 16;
+                            decodeParam.in_data_size = 80;
+                            decodeParam.dec_info.nchans = 1;
+                            decodeParam.dec_info.sample_rate = 16000;
+                            decodeParam.out_buf = frame->data[0];
+                            if (!NET_DVR_DecodeG722Frame(dp->g722_decoder, &decodeParam))
+                            {
+                                LONG pErrorNo = NET_DVR_GetLastError();
+                                fprintf(stderr, "NET_DVR_DecodeG722Frame error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+                            }
+
+                            struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+                            if (elem)
+                            {
+                                elem->bType = 1;
+                                elem->data = (char *)frame;
+                                elem->dwBufLen = 0;
+                                pthread_mutex_lock(&ps->lock);
+                                TAILQ_INSERT_TAIL(&ps->push_head, elem, entries);
+                                pthread_mutex_unlock(&ps->lock);
+                            }
+                //                 elem->bType = 0;
+                //                 elem->data = (char *)malloc(decodeParam.out_frame_size + 16);
+                //                 psm->psm_length = htons(decodeParam.out_frame_size + 10);
+                //                 memcpy(elem->data, pBuffer, 16);
+                //                 memcpy(elem->data + 16, decodeParam.out_buf, decodeParam.out_frame_size);
+                //                 elem->dwBufLen = 16 + decodeParam.out_frame_size;
+                                
+                //                 dump_hex((unsigned char *)elem->data, elem->dwBufLen);
+
+                //                 unsigned char *pOffset = pBuffer + 6 + 3;
+                //                 // https://blog.csdn.net/donglicaiju76152/article/details/124823760
+                //                 if (pes_head->PTS_DTS_flags == 2)
+                //                 {
+                //                     pOffset += 10;
+                //                     // 5 bytes of DTS
+                //                 } else if (pes_head->PTS_DTS_flags == 3)
+                //                 {
+                //                     pOffset += 10;
+                //                     // 5 bytes of DTS
+                //                     // 5 bytes of PTS
+                //                 }
+                //                 if (pes_head->ESCR_flag == 3)
+                //                 {
+                //                     pOffset += 8;
+                //                     // 48 bit
+                //                     // reserved                // 2  bslbf
+                //                     // ESCR_base[32..30]       // 3  bslbf
+                //                     // marker_bit              // 1  bslbf
+                //                     // ESCR_base[29..15]       // 15 bslbf
+                //                     // marker_bit              // 1  bslbf
+                //                     // ESCR_base[14..0]        // 15 bslbf
+                //                     // marker_bit              // 1  bslbf
+                //                     // ESCR_extension          // 9  bslbf
+                //                     // marker_bit              // 1  bslbf
+                //                 }
+                //                 if (pes_head->ESCR_flag == 1)
+                //                 {
+                //                     pOffset += 4;
+                //                     // 24 bit
+                //                     // marker_bit              // 1  bslbf
+                //                     // ES_rate                 // 22 bslbf
+                //                     // marker_bit              // 1  bslbf
+                //                 }
+                //                 if (pes_head->DSM_trick_mode_flag) {
+                //                     pOffset += 1;
+                //                     // 8 bit
+                //                     // trick_mode_control      // 3  bslbf
+                //                     // if (trick_mode_control == fast_forward) {
+                //                         // field_id            // 2  bslbf
+                //                         // intra_slice_refresh // 1  bslbf
+                //                         // frequency_truncation// 2  bslbf
+                //                     // } else if (trick_mode_control == slow_motion) {
+                //                         // rep_cntrl           // 5  bslbf
+                //                     // } else if (trick_mode_control == freeze_frame) {
+                //                         // field_id            // 2  bslbf
+                //                         // reserved            // 3  bslbf
+                //                     // } else if (trick_mode_control == fast_reverse) {
+                //                         // field_id            // 2  bslbf
+                //                         // intra_slice_refresh // 1  bslbf
+                //                         // frequency_truncation// 2  bslbf
+                //                     // } else if (trick_mode_control == slow_reverse) {
+                //                         // rep_cntrl           // 5  bslbf
+                //                     // } else {
+                //                         // reserved            // 5  bslbf
+                //                     // }
+                //                 }
+                //                 if (pes_head->additional_copy_info_flag) {
+                //                     pOffset += 1;
+                //                     // marker_bit              // 1  bslbf
+                //                     // additional_copy_info    // 7  bslbf
+                //                 }
+                //                 if (pes_head->PES_CRC_flag) {
+                //                     pOffset += 2;
+                //                     // previous_PES_packet_CRC // 16 bslbf
+                //                 }
+                //                 if (pes_head->PES_extension_flag) {
+                //                     mpeg_pes_extension_t *pes_ext = (mpeg_pes_extension_t *)pOffset;
+                //                     pOffset += 1;
+                //                     if (pes_ext->PES_private_data_flag == '1') {
+                //                         pOffset += 16;
+                //                         // PES_private_data    // 128 bslbf
+                //                     }
+                //                     if (pes_ext->pack_header_field_flag == '1') {
+                //                         printf("pack_field_length = %d\n", pOffset);
+                //                         pOffset += 1;
+                //                            // 8  bslbf
+                //                         // pack_header()
+                //                     }
+                //                     if (pes_ext->program_packet_sequence_counter_flag == '1') {
+                //                         pOffset += 2;
+                //                         // marker_bit             // 1  bslbf
+                //                         // program_packet_sequence_counter // 7  bslbf
+                //                         // marker_bit             // 1  bslbf
+                //                         // MPEG1_MPEG2_identifier // 1  bslbf
+                //                         // original_stuff_length  // 6  bslbf
+                //                     }
+                //                     if (pes_ext->P_STD_buffer_flag == '1') {
+                //                         pOffset += 2;
+                //                         // '01'                // 2  bslbf
+                //                         // P-STD_buffer_scale  // 1  bslbf
+                //                         // P-STD_buffer_size   // 13 bslbf
+                //                     }
+                //                     if (pes_ext->PES_extension_flag_2 == '1') {
+                //                         int PES_extension_field_length = pOffset[0] & 0x7F;
+
+                //                         pOffset += 1 + PES_extension_field_length;
+
+                //                         printf("PES_extension_field_length = %d\n", PES_extension_field_length);
+                //                         // marker_bit          // 1  bslbf
+                //                         // PES_extension_field_length // 7  bslbf
+                //                         // for (i=0; i < PES_extension_field_length; i++) {
+                //                         //     reserved        // 8  bslbf
+                //                         // }
+                //                     }
+                //                 }
+                //                 printf("psm_stream_info_len = %d  ESCR_flag = %d\n", psm->psm_stream_info_len, pOffset - pBuffer);
+                // fwrite(elem->data, elem->dwBufLen, 1, fp);
+                // fflush(fp);
+                //                 pthread_mutex_lock(&ps->lock);
+                //                 TAILQ_INSERT_TAIL(&ps->decode_head, elem, entries);
+                //                 pthread_mutex_unlock(&ps->lock);
+                //             }
+                            // av_frame_free(&frame);
+
+                            break;
+                            // input_frame->nb_samples *= 8;
+                            // 
+                            // printf("samples = %d  buf size = %d line size: %d\n", );
+
+                        }
                     // {
                     //     unsigned short stream_map_length = htons(*(uint16_t *)(pBuffer + sizeof(program_stream_map_t) + psm->psm_stream_info_len));
                     //     // printf("rx audio psm_length: %d psm_stream_info_len: %d  stream_map_length: %d data size %d\n",
@@ -1204,7 +1508,7 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                         struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
                         if (elem)
                         {
-                            elem->lCommand = 0;
+                            elem->bType = 0;
                             elem->data = (char *)malloc(dwBufSize);
                             memcpy(elem->data, pBuffer, dwBufSize);
                             elem->dwBufLen = dwBufSize;
@@ -1312,6 +1616,7 @@ int main(int argc, char **argv)
     ps->decthread_ctx = (HIKEvent_DecodeThread *)calloc(1, sizeof(HIKEvent_DecodeThread));
     ps->decthread_ctx->ps = ps;
     pthread_create(&ps->decthread_ctx->thread, NULL, decode_thread, ps->decthread_ctx);
+    pthread_create(&ps->decthread_ctx->process_thread, NULL, process_thread, ps->decthread_ctx);
 
     int error;
     if ((error = avio_open(&pOutputIO, argv[0],
@@ -1345,6 +1650,35 @@ int main(int argc, char **argv)
         fprintf(stderr, "NET_DVR_GetCurrentAudioCompress error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
         return pErrorNo;
     }
+
+    // NET_DVR_XML_CONFIG_INPUT inputParam;
+    // NET_DVR_XML_CONFIG_OUTPUT outputParam;
+
+    // memset(&inputParam, 0, sizeof(NET_DVR_XML_CONFIG_INPUT));
+    // inputParam.dwSize = sizeof(NET_DVR_XML_CONFIG_INPUT);
+    
+    // memset(&outputParam, 0, sizeof(NET_DVR_XML_CONFIG_OUTPUT));
+    // outputParam.dwSize = sizeof(NET_DVR_XML_CONFIG_OUTPUT);
+    // inputParam.lpRequestUrl = (char *)malloc(1024);
+    // inputParam.lpInBuffer = (char *)malloc(4096);
+    // sprintf((char *)inputParam.lpRequestUrl, "PUT /ISAPI/System/TwoWayAudio/channels/%d", cameraNo);
+    // inputParam.dwRequestUrlLen = strlen((char *)inputParam.lpRequestUrl);
+    // strcpy((char *)inputParam.lpInBuffer, "<?xml version=\"1.0\" encoding=\"UTF-8\"?><TwoWayAudioChannel><id>1</id><enabled>true</enabled><audioCompressionType>G.711alaw</audioCompressionType></TwoWayAudioChannel>");
+    // inputParam.dwInBufferSize = strlen((char *)inputParam.lpInBuffer);
+
+    // outputParam.dwOutBufferSize = 1048576 * 32;    // 32 MB
+    // outputParam.lpOutBuffer = malloc(outputParam.dwOutBufferSize);
+    // outputParam.dwStatusSize = 1048576;    // 1 MB
+    // outputParam.lpStatusBuffer = malloc(outputParam.dwStatusSize);
+    // if (!NET_DVR_STDXMLConfig(ps->lUserID, &inputParam, &outputParam))
+    // {
+    //     LONG pErrorNo = NET_DVR_GetLastError();
+    //     fprintf(stderr, "NET_DVR_STDXMLConfig error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+    //     free(outputParam.lpStatusBuffer);
+    //     free(outputParam.lpOutBuffer);
+
+    //     return pErrorNo;
+    // }
     
     NET_DVR_PREVIEWINFO struPlayInfo = {0};
     struPlayInfo.hPlayWnd     = 0;  // 仅取流不解码。这是Linux写法，Windows写法是struPlayInfo.hPlayWnd = NULL;
@@ -1364,7 +1698,7 @@ int main(int argc, char **argv)
     }
     
     ps->last_reset = microtime();
-    while (keepRunning && ESRCH != pthread_kill(ps->decthread_ctx->thread, 0))
+    while (keepRunning && ESRCH != pthread_kill(ps->decthread_ctx->thread, 0) && ESRCH != pthread_kill(ps->decthread_ctx->process_thread, 0))
     {
         double now = microtime();
         if (now - ps->last_reset > 1)
@@ -1375,7 +1709,7 @@ int main(int argc, char **argv)
             ps->tx_size = 0;
             ps->last_reset = now;
         }
-        sleep(0.01);
+        usleep(100000);   // wait 100ms
     }
     if (ps->plivectx && ps->decthread_ctx->outputHeaderWrite)
         av_write_trailer(ps->plivectx);
