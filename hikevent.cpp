@@ -80,6 +80,9 @@ typedef struct {
 
     AVIOContext* pb = nullptr;
     AVFormatContext *pFormatCtx = NULL;
+    struct SwsContext *sws_ctx;
+    int      video_src_linesize[4];
+    int      video_dst_linesize[4];
     pthread_t *decodeThread;
     // AVCodecContext *codec_ctx;
     // AVCodecParserContext *parser;
@@ -88,18 +91,6 @@ typedef struct {
 
     /* Type-specific fields go here. */
 } PyHIKEvent_Object;
-
-struct hikevent_queue_t {
-    long lCommand;
-    PyHIKEvent_Object *ps;
-    struct SwsContext *sws_ctx;
-    int      video_src_linesize[4];
-    int      video_dst_linesize[4];
-    LONG nPort;
-    TAILQ_ENTRY(hikevent_queue_t) entries;
-};
-
-static TAILQ_HEAD(tailhead, hikevent_queue_t) hikq_head;
 
 void CALLBACK MessageCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pAlarmInfo, DWORD dwBufLen, void* pUser)
 {
@@ -175,10 +166,6 @@ hikevent_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 
     // NET_DVR_SetDVRMessageCallBack_V31(MessageCallback_V31, (void *)ps);
     NET_DVR_SetDVRMessageCallBack_V51(0, MessageCallback, (void *)ps);
-
-    struct hikevent_queue_t *elem = (struct hikevent_queue_t *)calloc(1, sizeof(struct hikevent_queue_t));
-    elem->ps = ps;
-    TAILQ_INSERT_HEAD(&hikq_head, elem, entries);
 
     return (PyObject *) ps;
 }
@@ -800,11 +787,11 @@ void yv12toYUV(char *outYuv, char *inYv12, int width, int height, int widthStep)
 }
 
 
-void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInfo, void * nReserved1, int nReserved2)
+void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInfo, void *pUser, int nReserved2)
 {
     long lFrameType = pFrameInfo->nType;
-    PyHIKEvent_Object *dec_ps = NULL;
-    hikevent_queue_t *q;
+
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)pUser;
     struct SwsContext *sws_ctx = NULL;
     int      video_src_linesize[4];
     int      video_dst_linesize[4];
@@ -816,47 +803,37 @@ void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInf
         return;
     }
 
-    q = TAILQ_FIRST(&hikq_head);
-    while (q != NULL) {
-        if (q->ps->nPort == nPort)
-        {
-            dec_ps = q->ps;
-            if (q->sws_ctx == NULL)
-            {
-                q->sws_ctx = sws_getContext(pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_YUV420P,
-                             pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_RGB24,
-                             SWS_FAST_BILINEAR, NULL, NULL, NULL);
-                /* allocate image where the decoded image will be put */
-                int ret = av_image_alloc(video_src_data, q->video_src_linesize,
-                                     pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_YUV420P, 1);
-                if (ret < 0) {
-                    fprintf(stderr, "Could not allocate raw video buffer\n");
-                    return;
-                }
-                /* allocate image where the decoded image will be put */
-                ret = av_image_alloc(video_dst_data, q->video_dst_linesize,
-                                     pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_RGB24, 1);
-                if (ret < 0) {
-                    fprintf(stderr, "Could not allocate raw video buffer\n");
-                    return;
-                }
-                av_freep(&video_src_data[0]);
-                av_freep(&video_dst_data[0]);
-            }
-            sws_ctx = q->sws_ctx;
-            memcpy(video_src_linesize, q->video_src_linesize, sizeof(int) * 4);
-            memcpy(video_dst_linesize, q->video_dst_linesize, sizeof(int) * 4);
-
-            break;
-        }        
-        
-        q = TAILQ_NEXT(q, entries);
-    }
-    if (dec_ps == NULL)
+    if (ps == NULL)
     {
         fprintf(stderr, "Error: cannnot found decode context\n");
         return;
     }
+
+    if (ps->sws_ctx == NULL)
+    {
+        ps->sws_ctx = sws_getContext(pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_YUV420P,
+                     pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_RGB24,
+                     SWS_FAST_BILINEAR, NULL, NULL, NULL);
+        /* allocate image where the decoded image will be put */
+        int ret = av_image_alloc(video_src_data, ps->video_src_linesize,
+                             pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_YUV420P, 1);
+        if (ret < 0) {
+            fprintf(stderr, "Could not allocate raw video buffer\n");
+            return;
+        }
+        /* allocate image where the decoded image will be put */
+        ret = av_image_alloc(video_dst_data, ps->video_dst_linesize,
+                             pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_RGB24, 1);
+        if (ret < 0) {
+            fprintf(stderr, "Could not allocate raw video buffer\n");
+            return;
+        }
+        av_freep(&video_src_data[0]);
+        av_freep(&video_dst_data[0]);
+    }
+    sws_ctx = ps->sws_ctx;
+    memcpy(video_src_linesize, ps->video_src_linesize, sizeof(int) * 4);
+    memcpy(video_dst_linesize, ps->video_dst_linesize, sizeof(int) * 4);
 
     if (lFrameType == T_YV12)
     {
@@ -880,9 +857,9 @@ void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInf
         elem->pAlarmInfo = yuvData;
         elem->dwBufLen = 8 + pFrameInfo->nWidth * pFrameInfo->nHeight * 3;
         memcpy(elem->pAlarmInfo, yuvData, elem->dwBufLen);
-        pthread_mutex_lock(&dec_ps->lock);
-        TAILQ_INSERT_TAIL(&dec_ps->head, elem, entries);
-        pthread_mutex_unlock(&dec_ps->lock);
+        pthread_mutex_lock(&ps->lock);
+        TAILQ_INSERT_TAIL(&ps->head, elem, entries);
+        pthread_mutex_unlock(&ps->lock);
     }
 }
 
@@ -1240,7 +1217,7 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 {
                     fprintf(stderr,"Error: PlayM4_OpenStream %d\n", PlayM4_GetLastError(ps->nPort));
                 }
-                if (!PlayM4_SetDecCallBack(ps->nPort, DecCBFun))
+                if (!PlayM4_SetDecCallBackMend(ps->nPort, DecCBFun, ps))
                 {
                     fprintf(stderr,"Error: PlayM4_SetDecCallback %d\n", PlayM4_GetLastError(ps->nPort));
                 }
@@ -1343,6 +1320,12 @@ static PyObject *stopRealPlay(PyObject *self, PyObject *args) {
     long lRealPlayHandle;
     if (!PyArg_ParseTuple(args, "I", &lRealPlayHandle)) {
         return NULL;
+    }
+
+    if (ps->sws_ctx)
+    {
+        sws_freeContext(ps->sws_ctx);
+        ps->sws_ctx = NULL;
     }
 
     if (false == NET_DVR_StopRealPlay(lRealPlayHandle)) {    // 停止取流
@@ -2317,18 +2300,10 @@ static void release(PyObject *self) {
 
     pthread_mutex_destroy(&ps->lock);
 
-    struct hikevent_queue_t *np, *q = NULL;
-
-    TAILQ_FOREACH(np, &hikq_head, entries)
+    if (ps->sws_ctx)
     {
-        if (np->ps == ps)
-            q = np;
-    }
-    if (q != NULL)
-    {
-        TAILQ_REMOVE(&hikq_head, q, entries);
-        sws_freeContext(q->sws_ctx);
-        free(q);
+        sws_freeContext(ps->sws_ctx);
+        ps->sws_ctx = NULL;
     }
 
     if (ps->lVoiceHandler > 0)
@@ -2510,8 +2485,6 @@ PyMODINIT_FUNC PyInit_hikevent(void) {
         Py_DECREF(m);
         return NULL;
     }
-
-    TAILQ_INIT(&hikq_head);
 
     return m;
 
