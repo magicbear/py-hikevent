@@ -68,6 +68,8 @@ typedef struct HIKEvent_DecodeThread {
     char probedone;
     char stop;
 
+    NET_DVR_COMPRESSION_AUDIO compressAudioType;
+    
     int      video_src_linesize[4];
     int      video_dst_linesize[4];
 
