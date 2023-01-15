@@ -811,6 +811,7 @@ void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInf
 
     if (dp->sws_ctx == NULL)
     {
+        printf("Allocate\n");
         dp->sws_ctx = sws_getContext(pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_YUV420P,
                      pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_RGB24,
                      SWS_FAST_BILINEAR, NULL, NULL, NULL);
@@ -1275,6 +1276,9 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                                 }
 
                                 break;
+                            } else if (ps->decode_way <= 2)
+                            {
+                                break;  // Ignore Audio
                             }
                         case 0xba:  // PSH Header
                         case 0xe0:  // Video
@@ -1301,17 +1305,6 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                         default:
                             fprintf(stderr, "rx data  %08x \n", htonl(*(uint32_t *)pBuffer));
                     }
-                }
-                struct hik_queue_s *elem = (struct hik_queue_s *)calloc(1, sizeof(struct hik_queue_s));
-                if (elem)
-                {
-                    elem->bType = 0;
-                    elem->data = (char *)malloc(dwBufSize);
-                    memcpy(elem->data, pBuffer, dwBufSize);
-                    elem->dwBufLen = dwBufSize;
-                    pthread_mutex_lock(&dp->lock);
-                    TAILQ_INSERT_TAIL(&dp->decode_head, elem, entries);
-                    pthread_mutex_unlock(&dp->lock);
                 }
                 break;
             }
