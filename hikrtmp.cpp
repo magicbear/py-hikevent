@@ -15,50 +15,28 @@
 #include "HCNetSDK.h"
 #include "LinuxPlayM4.h"
 extern "C" { 
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavformat/avio.h>
-#include <libavutil/opt.h>
-#include <libavutil/file.h>
-#include <libavutil/audio_fifo.h>
-#include <libavutil/channel_layout.h>
-#include <libswresample/swresample.h>
-#include <libavutil/frame.h>
-#include <libavutil/mem.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/samplefmt.h>
-#include <libavutil/timestamp.h>
-#include <libavformat/avformat.h>
-#include <libswscale/swscale.h>
-
-char av_error[AV_ERROR_MAX_STRING_SIZE] = { 0 };
-char av_ts[AV_TS_MAX_STRING_SIZE] = { 0 };
-#undef av_err2str
-#undef av_ts2str
-#undef av_ts2timestr
-#define av_err2str(errnum) av_make_error_string(av_error, AV_ERROR_MAX_STRING_SIZE, errnum)
-#define av_ts2str(ts) av_ts_make_string(av_ts, ts)
-#define av_ts2timestr(ts, tb) av_ts_make_time_string(av_ts, ts, tb)
+#include "hikbase.h"
 }
 
 #define AV_AUDIO_TRANSCODE
 
-char		host[256] 	= {0};
-char		user[256] 	= {0};
-char		passwd[256] = {0};
+char        host[256]   = {0};
+char        user[256]   = {0};
+char        passwd[256] = {0};
 char        STREAM_VIDEO_CODEC[256] = {0};
 char        STREAM_AUDIO_CODEC[256] = {0};
-int  		cameraNo;
-int 		streamType;
+int         cameraNo;
+int         streamType;
 
-static const char *shortopts = ":h:u:p:c:s:Nv?";
+static const char *shortopts = ":h:u:p:c:s:P:Nv?";
 
 static struct option longopts[] = {
   {"host",          1, 0, 'h'},
   {"user",          1, 0, 'u'},
-  {"passwd", 	    1, 0, 'p'},
+  {"passwd",         1, 0, 'p'},
   {"camera",        1, 0, 'c'},
   {"stream-type",   1, 0, 's'},
+  {"playback",      1, 0, 'P'},
   {"ignore-acodec", 0, 0, 'N'},
   {"verbose",       0, 0, 'v'},
   {"help",          0, 0, '?'},
@@ -72,15 +50,6 @@ void intHandler(int dummy) {
     keepRunning = 0;
 }
 
-struct entry {
-    int bType;
-    char *data;
-    int start;
-    size_t dwBufLen;
-    TAILQ_ENTRY(entry) entries;
-};
-
-struct HIKEvent_DecodeThread;
 
 typedef struct {
     char *ip;
@@ -97,6 +66,7 @@ typedef struct {
     int transcode;
     int debug_packet;
 
+    time_t   playback;
     uint32_t rx_size;
     uint32_t tx_size;
     double   last_reset;
@@ -104,467 +74,17 @@ typedef struct {
     struct HIKEvent_DecodeThread *decthread_ctx;
 
     pthread_mutex_t lock;
-    TAILQ_HEAD(decode_tailhead, entry) decode_head;
-    TAILQ_HEAD(push_tailhead, entry) push_head;
 
     AVFormatContext *plivectx = nullptr;
     /* Type-specific fields go here. */
 } HIKEvent_Object;
 
-typedef struct HIKEvent_DecodeThread {
-    HIKEvent_Object *ps;
-    pthread_t thread;
-    pthread_t process_thread;
-    AVStream *out_vstream;
-    AVStream *out_astream;
 
-    int64_t       global_pts;
+static volatile HIKEvent_Object *global_ps = NULL;
 
-    /* Global timestamp for the audio frames. */
-    int64_t video_pts;
-    int64_t audio_pts;
-
-    int src_rate;
-    int dst_rate;
-
-    AVFormatContext *pFormatCtx;
-    AVCodecContext *dec_ctx;
-    AVCodecContext *enc_ctx;
-    SwrContext *swr;
-    AVAudioFifo *fifo;
-    void *g722_decoder;
-    bool outputHeaderWrite;
-    bool probedone;
-} HIKEvent_DecodeThread;
-
-#define MICRO_IN_SEC 1000000.00
-
-double microtime(void)
-{
-    struct timeval tp = {0};
-
-    if (gettimeofday(&tp, NULL)) {
-        return 0;
-    }
-
-    return ((double)(tp.tv_sec + tp.tv_usec / MICRO_IN_SEC));
-}
-
-static void log_packet(const AVFormatContext *fmt_ctx, const AVPacket *pkt, int output)
-{
-    AVRational *time_base = &fmt_ctx->streams[pkt->stream_index]->time_base;
-
-    fprintf(stderr, "[\033[%s%s\033[0m \033[%s%s\033[0m %d] pts:%16" PRId64 " pts_time:%-8s dts:%16" PRId64 " dts_time:%-8s duration:%-8s duration_time:%-8s tb: %4d/%-8d size: %d\n",
-        (output ? "92m" :  "31m"),
-        output?"OUT" : "IN ",
-        fmt_ctx->streams[pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ? "38;5;118m" : "38;5;196m",
-        fmt_ctx->streams[pkt->stream_index]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ? "video" : "audio", pkt->stream_index,
-           pkt->pts, av_ts2timestr(pkt->pts, time_base),
-           pkt->dts, av_ts2timestr(pkt->dts, time_base),
-           av_ts2str(pkt->duration), av_ts2timestr(pkt->duration, time_base),
-           time_base->num, time_base->den, 
-           pkt->buf ? pkt->buf->size : -1);
-}
-
-
-/**
- * Initialize one data packet for reading or writing.
- * @param[out] packet Packet to be initialized
- * @return Error code (0 if successful)
- */
-static int init_packet(AVPacket **packet)
-{
-    if (!(*packet = av_packet_alloc())) {
-        fprintf(stderr, "Could not allocate packet\n");
-        return AVERROR(ENOMEM);
-    }
-    return 0;
-}
-
-/**
- * Initialize one audio frame for reading from the input file.
- * @param[out] frame Frame to be initialized
- * @return Error code (0 if successful)
- */
-static int init_input_frame(AVFrame **frame)
-{
-    if (!(*frame = av_frame_alloc())) {
-        fprintf(stderr, "Could not allocate input frame\n");
-        return AVERROR(ENOMEM);
-    }
-    return 0;
-}
-
-/**
- * Decode one audio frame from the input file.
- * @param      frame                Audio frame to be decoded
- * @param      input_format_context Format context of the input file
- * @param      input_codec_context  Codec context of the input file
- * @param[out] data_present         Indicates whether data has been decoded
- * @param[out] finished             Indicates whether the end of file has
- *                                  been reached and all data has been
- *                                  decoded. If this flag is false, there
- *                                  is more data to be decoded, i.e., this
- *                                  function has to be called again.
- * @return Error code (0 if successful)
- */
-static int decode_audio_frame(AVFrame *frame,
-                              AVPacket *input_packet,
-                              AVCodecContext *input_codec_context,
-                              int *data_present, int *finished)
-{
-    int error;
-
-    /* Send the audio frame stored in the temporary packet to the decoder.
-     * The input audio stream decoder is used to do this. */
-    if ((error = avcodec_send_packet(input_codec_context, input_packet)) < 0) {
-        fprintf(stderr, "Could not send packet for decoding (error '%s')\n",
-                av_err2str(error));
-        goto cleanup;
-    }
-
-    /* Receive one frame from the decoder. */
-    error = avcodec_receive_frame(input_codec_context, frame);
-    /* If the decoder asks for more data to be able to decode a frame,
-     * return indicating that no data is present. */
-    if (error == AVERROR(EAGAIN)) {
-        error = 0;
-        goto cleanup;
-    /* If the end of the input file is reached, stop decoding. */
-    } else if (error == AVERROR_EOF) {
-        *finished = 1;
-        error = 0;
-        goto cleanup;
-    } else if (error < 0) {
-        fprintf(stderr, "Could not decode frame (error '%s')\n",
-                av_err2str(error));
-        goto cleanup;
-    /* Default case: Return decoded data. */
-    } else {
-        *data_present = 1;
-        goto cleanup;
-    }
-
-cleanup:
-    return error;
-}
-
-/**
- * Add converted input audio samples to the FIFO buffer for later processing.
- * @param fifo                    Buffer to add the samples to
- * @param converted_input_samples Samples to be added. The dimensions are channel
- *                                (for multi-channel audio), sample.
- * @param frame_size              Number of samples to be converted
- * @return Error code (0 if successful)
- */
-static int add_samples_to_fifo(AVAudioFifo *fifo,
-                               uint8_t **converted_input_samples,
-                               const int frame_size)
-{
-    int error;
-
-    /* Make the FIFO as large as it needs to be to hold both,
-     * the old and the new samples. */
-    if ((error = av_audio_fifo_realloc(fifo, av_audio_fifo_size(fifo) + frame_size)) < 0) {
-        fprintf(stderr, "Could not reallocate FIFO\n");
-        return error;
-    }
-
-    /* Store the new samples in the FIFO buffer. */
-    if (av_audio_fifo_write(fifo, (void **)converted_input_samples,
-                            frame_size) < frame_size) {
-        fprintf(stderr, "Could not write data to FIFO\n");
-        return AVERROR_EXIT;
-    }
-    return 0;
-}
-
-
-/**
- * Initialize a temporary storage for the specified number of audio samples.
- * The conversion requires temporary storage due to the different format.
- * The number of audio samples to be allocated is specified in frame_size.
- * @param[out] converted_input_samples Array of converted samples. The
- *                                     dimensions are reference, channel
- *                                     (for multi-channel audio), sample.
- * @param      output_codec_context    Codec context of the output file
- * @param      frame_size              Number of samples to be converted in
- *                                     each round
- * @return Error code (0 if successful)
- */
-static int init_converted_samples(uint8_t ***converted_input_samples,
-                                  AVCodecContext *output_codec_context,
-                                  int frame_size)
-{
-    int error;
-
-    /* Allocate as many pointers as there are audio channels.
-     * Each pointer will later point to the audio samples of the corresponding
-     * channels (although it may be NULL for interleaved formats).
-     */
-    if (!(*converted_input_samples = (uint8_t **)calloc(output_codec_context->channels,
-                                            sizeof(**converted_input_samples)))) {
-        fprintf(stderr, "Could not allocate converted input sample pointers\n");
-        return AVERROR(ENOMEM);
-    }
-
-    /* Allocate memory for the samples of all channels in one consecutive
-     * block for convenience. */
-    if ((error = av_samples_alloc(*converted_input_samples, NULL,
-                                  output_codec_context->channels,
-                                  frame_size,
-                                  output_codec_context->sample_fmt, 0)) < 0) {
-        fprintf(stderr,
-                "Could not allocate converted input samples (error '%s')\n",
-                av_err2str(error));
-        av_freep(&(*converted_input_samples)[0]);
-        free(*converted_input_samples);
-        return error;
-    }
-    return 0;
-}
-
-/**
- * Convert the input audio samples into the output sample format.
- * The conversion happens on a per-frame basis, the size of which is
- * specified by frame_size.
- * @param      input_data       Samples to be decoded. The dimensions are
- *                              channel (for multi-channel audio), sample.
- * @param[out] converted_data   Converted samples. The dimensions are channel
- *                              (for multi-channel audio), sample.
- * @param      frame_size       Number of samples to be converted
- * @param      resample_context Resample context for the conversion
- * @return Error code (0 if successful)
- */
-static int convert_samples(const uint8_t **input_data,
-                           uint8_t **converted_data, 
-                           const int src_frame_size,
-                           const int dst_frame_size,
-                           SwrContext *resample_context)
-{
-    int error;
-
-    /* Convert the samples using the resampler. */
-    if ((error = swr_convert(resample_context,
-                             converted_data, dst_frame_size,
-                             input_data    , src_frame_size)) < 0) {
-        fprintf(stderr, "Could not convert input samples (error '%s')\n",
-                av_err2str(error));
-        return error;
-    }
-
-    return 0;
-}
-
-
-static int convert_and_store(HIKEvent_DecodeThread *dp,
-                                         AVFrame *input_frame,
-                                         int *dst_nb_samples,
-                                         int *finished)
-{
-    /* Temporary storage for the converted input samples. */
-    uint8_t **converted_input_samples = NULL;
-    int ret = AVERROR_EXIT;
-
-    /* If there is decoded data, convert and store it. */
-    /* compute the number of converted samples: buffering is avoided
-     * ensuring that the output buffer will contain at least all the
-     * converted input samples */
-    *dst_nb_samples =
-        av_rescale_rnd(input_frame->nb_samples, dp->dst_rate, dp->src_rate, AV_ROUND_UP);
-
-    /* Initialize the temporary storage for the converted input samples. */
-    if (init_converted_samples(&converted_input_samples, dp->enc_ctx,
-                               *dst_nb_samples))
-        goto cleanup;
-
-    /* Convert the input samples to the desired output sample format.
-     * This requires a temporary storage provided by converted_input_samples. */
-    if (convert_samples((const uint8_t**)input_frame->extended_data, converted_input_samples,
-                        input_frame->nb_samples, *dst_nb_samples, dp->swr))
-        goto cleanup;
-
-    /* Add the converted input samples to the FIFO buffer for later processing. */
-    if (add_samples_to_fifo(dp->fifo, converted_input_samples,
-                            *dst_nb_samples))
-        goto cleanup;
-    ret = 0;
-
-cleanup:
-    if (converted_input_samples) {
-        av_freep(&converted_input_samples[0]);
-        free(converted_input_samples);
-    }
-
-    return ret;
-}
-
-/**
- * Read one audio frame from the input file, decode, convert and store
- * it in the FIFO buffer.
- * @param      fifo                 Buffer used for temporary storage
- * @param      input_format_context Format context of the input file
- * @param      input_codec_context  Codec context of the input file
- * @param      output_codec_context Codec context of the output file
- * @param      resampler_context    Resample context for the conversion
- * @param[out] finished             Indicates whether the end of file has
- *                                  been reached and all data has been
- *                                  decoded. If this flag is false,
- *                                  there is more data to be decoded,
- *                                  i.e., this function has to be called
- *                                  again.
- * @return Error code (0 if successful)
- */
-static int read_decode_convert_and_store(HIKEvent_DecodeThread *dp,
-                                         AVPacket *input_packet,
-                                         int *dst_nb_samples,
-                                         int *finished)
-{
-    /* Temporary storage of the input samples of the frame read from the file. */
-    AVFrame *input_frame = NULL;
-    int data_present = 0;
-    int ret = AVERROR_EXIT;
-
-    /* Initialize temporary storage for one input frame. */
-    if (init_input_frame(&input_frame))
-        goto cleanup;
-    /* Decode one frame worth of audio samples. */
-    if (decode_audio_frame(input_frame, input_packet,
-                           dp->dec_ctx, &data_present, finished))
-        goto cleanup;
-    /* If we are at the end of the file and there are no more samples
-     * in the decoder which are delayed, we are actually finished.
-     * This must not be treated as an error. */
-    if (*finished) {
-        ret = 0;
-        goto cleanup;
-    }
-    /* If there is decoded data, convert and store it. */
-    if (data_present) {
-        ret = convert_and_store(dp, input_frame, dst_nb_samples, finished);
-    }
-    ret = 0;
-
-cleanup:
-    av_frame_free(&input_frame);
-
-    return ret;
-}
-
-
-/**
- * Initialize one input frame for writing to the output file.
- * The frame will be exactly frame_size samples large.
- * @param[out] frame                Frame to be initialized
- * @param      output_codec_context Codec context of the output file
- * @param      frame_size           Size of the frame
- * @return Error code (0 if successful)
- */
-static int init_output_frame(AVFrame **frame,
-                             AVCodecContext *output_codec_context,
-                             int frame_size)
-{
-    int error;
-
-    /* Create a new frame to store the audio samples. */
-    if (!(*frame = av_frame_alloc())) {
-        fprintf(stderr, "Could not allocate output frame\n");
-        return AVERROR_EXIT;
-    }
-
-    /* Set the frame's parameters, especially its size and format.
-     * av_frame_get_buffer needs this to allocate memory for the
-     * audio samples of the frame.
-     * Default channel layouts based on the number of channels
-     * are assumed for simplicity. */
-    (*frame)->nb_samples     = frame_size;
-    (*frame)->channel_layout = output_codec_context->channel_layout;
-    (*frame)->format         = output_codec_context->sample_fmt;
-    (*frame)->sample_rate    = output_codec_context->sample_rate;
-
-    /* Allocate the samples of the created frame. This call will make
-     * sure that the audio frame can hold as many samples as specified. */
-    if ((error = av_frame_get_buffer(*frame, 0)) < 0) {
-        fprintf(stderr, "Could not allocate output frame samples (error '%s') nb_samples: %d  sample_rate: %d  format: %d\n",
-                av_err2str(error), frame_size, output_codec_context->sample_rate, output_codec_context->sample_fmt);
-        av_frame_free(frame);
-        return error;
-    }
-
-    return 0;
-}
-
-/**
- * Encode one frame worth of audio to the output file.
- * @param      frame                 Samples to be encoded
- * @param      output_format_context Format context of the output file
- * @param      output_codec_context  Codec context of the output file
- * @param[out] data_present          Indicates whether data has been
- *                                   encoded
- * @return Error code (0 if successful)
- */
-static int encode_audio_frame(HIKEvent_DecodeThread *dp,
-                              AVFrame *frame,
-                              AVPacket **pkt,
-                              AVCodecContext *output_codec_context,
-                              int *data_present)
-{
-    /* Packet used for temporary storage. */
-    AVPacket *output_packet;
-    int error;
-
-    error = init_packet(&output_packet);
-    if (error < 0)
-        return error;
-
-    /* Set a timestamp based on the sample rate for the container. */
-    if (frame) {
-        frame->pts = dp->audio_pts;
-        dp->audio_pts += frame->nb_samples;
-    }
-
-    /* Send the audio frame stored in the temporary packet to the encoder.
-     * The output audio stream encoder is used to do this. */
-    error = avcodec_send_frame(output_codec_context, frame);
-    /* The encoder signals that it has nothing more to encode. */
-    if (error == AVERROR_EOF) {
-        error = 0;
-        goto cleanup;
-    } else if (error < 0) {
-        fprintf(stderr, "Could not send packet for encoding (error '%s')\n",
-                av_err2str(error));
-        goto cleanup;
-    }
-
-    /* Receive one encoded frame from the encoder. */
-    error = avcodec_receive_packet(output_codec_context, output_packet);
-    /* If the encoder asks for more data to be able to provide an
-     * encoded frame, return indicating that no data is present. */
-    if (error == AVERROR(EAGAIN)) {
-        error = 0;
-        goto cleanup;
-    /* If the last frame has been encoded, stop encoding. */
-    } else if (error == AVERROR_EOF) {
-        error = 0;
-        goto cleanup;
-    } else if (error < 0) {
-        fprintf(stderr, "Could not encode frame (error '%s')\n",
-                av_err2str(error));
-        goto cleanup;
-    /* Default case: Return encoded data. */
-    } else {
-        *data_present = 1;
-    }
-
-    /* Write one audio frame from the temporary packet to the output file. */
-    if (*data_present)
-    {
-        *pkt = output_packet;
-    }
-
-cleanup:
-    // av_packet_free(&output_packet);
-    return error;
+void debugHandler(int dummy) {
+    if (global_ps != NULL)
+        global_ps->debug_packet = (global_ps->debug_packet + 1) % 4;
 }
 
 
@@ -574,7 +94,7 @@ int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st)
     int ret = 0;
     AVCodec *enc_codec;
 
-    printf("init audio encoder  Audio Encode Type: %d\n", ps->compressAudioType.byAudioEncType);
+    fprintf(stderr, "init audio encoder  Audio Encode Type: %d\n", ps->compressAudioType.byAudioEncType);
 
     int sampleRate = ps->compressAudioType.byAudioSamplingRate;
     switch(ps->compressAudioType.byAudioSamplingRate)
@@ -590,7 +110,7 @@ int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st)
     {
     case 0: // Note: Not support
     case 9:
-        dp->ps->transcode = -1;
+        ps->transcode = -1;
         // st->codecpar->codec_id = AV_CODEC_ID_ADPCM_G722;
         sampleRate = 16000;
         st->codecpar->codec_id = AV_CODEC_ID_PCM_S16LE;
@@ -642,7 +162,7 @@ int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st)
     }
 
 
-    if (dp->ps->transcode)
+    if (ps->transcode)
     {
         enc_codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
         // enc_codec = avcodec_find_encoder(AV_CODEC_ID_PCM_S16LE);
@@ -691,7 +211,7 @@ int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st)
         }
     }
 
-    dp->out_astream = avformat_new_stream(dp->ps->plivectx, NULL);
+    dp->out_astream = avformat_new_stream(ps->plivectx, NULL);
     if (!dp->out_astream) {
         ret = -1;
         fprintf(stderr, "Failed allocating output stream\n");
@@ -717,18 +237,19 @@ int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st)
     }
 
     av_dump_format(dp->pFormatCtx, 0, NULL, 0);
-    av_dump_format(dp->ps->plivectx, 0, NULL, 1);
+    av_dump_format(ps->plivectx, 0, NULL, 1);
     
     if (!dp->outputHeaderWrite)
     {
         dp->outputHeaderWrite = true;
-        ret = avformat_write_header(dp->ps->plivectx, NULL);
+        fprintf(stderr, "Output: Write header\n");
+        ret = avformat_write_header(ps->plivectx, NULL);
         if (ret < 0) {
             fprintf(stderr, "Error occurred when opening output file\n");
             goto end;
         }
     }
-    printf("init audio encoder ok\n");
+    fprintf(stderr, "init audio encoder ok\n");
     return ret;
 end:
     if (dp->dec_ctx)
@@ -765,20 +286,20 @@ void *process_thread(void *data)
     while (keepRunning)
     {
         AVPacket *pkt = NULL;
-        pthread_mutex_lock(&ps->lock);
-        if (TAILQ_EMPTY(&ps->push_head) || !dp->probedone)
+        pthread_mutex_lock(&dp->lock);
+        if (TAILQ_EMPTY(&dp->push_head) || !dp->probedone)
         {
-            pthread_mutex_unlock(&ps->lock);
+            pthread_mutex_unlock(&dp->lock);
             usleep(1000);
             continue;
         } else 
         {
-            struct entry *p = NULL;
-            p = TAILQ_FIRST(&ps->push_head);
+            struct hik_queue_s *p = NULL;
+            p = TAILQ_FIRST(&dp->push_head);
             bType = p->bType;
             pkt = (AVPacket *)p->data;
-            TAILQ_REMOVE(&ps->push_head, p, entries);
-            pthread_mutex_unlock(&ps->lock);
+            TAILQ_REMOVE(&dp->push_head, p, entries);
+            pthread_mutex_unlock(&dp->lock);
             free(p);
         }
 
@@ -795,23 +316,24 @@ void *process_thread(void *data)
         if (in_stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
         {
             AVStream *out_stream = dp->out_vstream;
-            // if (dp->out_astream == NULL)
-            // {
-            //     printf("waiting audio pts = %ld \n", pkt->pts);
-            //     av_packet_unref(pkt);
-            //     av_packet_free(&pkt);
-            //     continue;
-            // }
-            if (!dp->outputHeaderWrite)
+            if (dp->out_astream == NULL)
             {
-                dp->outputHeaderWrite = true;
-                ret = avformat_write_header(ps->plivectx, NULL);
-                if (ret < 0) {
-                    fprintf(stderr, "Error occurred when opening output file\n");
-                    goto end;
-                }
+                log_packet(pFormatCtx, pkt, 2);
+                av_packet_unref(pkt);
+                av_packet_free(&pkt);
+                continue;
             }
-            if (ps->debug_packet)
+            // if (!dp->outputHeaderWrite)
+            // {
+            //     dp->outputHeaderWrite = true;
+            //     fprintf(stderr, "Output: Write header\n");
+            //     ret = avformat_write_header(ps->plivectx, NULL);
+            //     if (ret < 0) {
+            //         fprintf(stderr, "Error occurred when opening output file\n");
+            //         goto end;
+            //     }
+            // }
+            if (ps->debug_packet & 0x1)
                 log_packet(pFormatCtx, pkt, 0);
             /* copy packet */
             av_packet_rescale_ts(pkt, in_stream->time_base, dp->out_vstream->time_base);
@@ -824,11 +346,11 @@ void *process_thread(void *data)
             pkt->stream_index = out_stream->index;
 
             ps->tx_size += pkt->buf ? pkt->buf->size : 0;
-            if (ps->debug_packet)
+            if (ps->debug_packet & 0x2)
                 log_packet(ps->plivectx, pkt, 1);
             ret = av_interleaved_write_frame(ps->plivectx, pkt);
             if (ret < 0) {
-                fprintf(stderr, "Error muxing packet %s\n", av_err2str(ret));
+                fprintf(stderr, "Error muxing video packet: %s\n", av_err2str(ret));
                 break;
             }
             av_packet_unref(pkt);
@@ -842,7 +364,7 @@ void *process_thread(void *data)
             int finished                = 0;
             int dst_nb_samples          = 0;
 
-            if (dp->ps->transcode)
+            if (ps->transcode)
             {
                 /* Decode one frame worth of audio samples, convert it to the
                      * output sample format and put it into the FIFO buffer. */
@@ -850,7 +372,7 @@ void *process_thread(void *data)
                 {
                     if (read_decode_convert_and_store(dp, pkt, &dst_nb_samples, &finished))
                         goto end;
-                    if (ps->debug_packet)
+                    if (ps->debug_packet & 0x1)
                         log_packet(pFormatCtx, pkt, 0);
                     av_packet_unref(pkt);
                     av_packet_free(&pkt);
@@ -862,6 +384,27 @@ void *process_thread(void *data)
                     av_frame_free(&frame);
                 }
                 
+                double audio_t = dp->audio_pts * av_q2d(dp->enc_ctx->time_base);
+                double video_t = dp->global_pts * av_q2d(dp->out_vstream->time_base);
+                if (audio_t > video_t + 1)
+                {
+                    fprintf(stderr, "ERROR: NOT SYNC Audio, reset audio buffer  audio pts = %" PRId64 "/%.6f  video pts = %" PRId64 "/%.6f\n", 
+                        dp->audio_pts,
+                        dp->audio_pts * av_q2d(dp->enc_ctx->time_base), 
+                        dp->global_pts,
+                        dp->global_pts * av_q2d(dp->out_vstream->time_base));
+                    av_audio_fifo_reset(dp->fifo);
+                    continue;
+                } else if (dp->audio_pts != 0 && audio_t < video_t - 1)
+                {
+                    fprintf(stderr, "ERROR: NOT SYNC Video, reset audio pts  audio pts = %" PRId64 "/%.6f  video pts = %" PRId64 "/%.6f\n", 
+                        dp->audio_pts,
+                        dp->audio_pts * av_q2d(dp->enc_ctx->time_base), 
+                        dp->global_pts,
+                        dp->global_pts * av_q2d(dp->out_vstream->time_base));
+                    dp->audio_pts = 0;
+                }
+
                 if (dp->audio_pts == 0)
                 {
                     if (dp->global_pts)
@@ -871,6 +414,7 @@ void *process_thread(void *data)
                     {
                         // Wait global pts, cache the audio frame to FIFO queue
                         // dp->audio_pts = av_rescale_q_rnd(pkt->pts, in_stream->time_base, dp->enc_ctx->time_base, AV_ROUND_UP);
+                        av_audio_fifo_reset(dp->fifo);
                         continue;
                     }
                 }
@@ -927,8 +471,6 @@ void *process_thread(void *data)
                         av_frame_free(&output_frame);
                         goto end;
                     }
-                    if (ps->debug_packet)
-                        log_packet(pFormatCtx, output_packet, 0);
                     if (data_written)
                     {
                         output_packet->pos = -1;
@@ -937,10 +479,12 @@ void *process_thread(void *data)
                         // Translate Encode timebase to outstream timebase
                         av_packet_rescale_ts(output_packet, dp->enc_ctx->time_base, dp->out_astream->time_base);
 
+                        if (ps->debug_packet & 0x2)
+                            log_packet(ps->plivectx, output_packet, 1);
                         // log_packet(ps->plivectx, output_packet, 1);
                         ret = av_interleaved_write_frame(ps->plivectx, output_packet);
                         if (ret < 0) {
-                            fprintf(stderr, "Error muxing packet\n");
+                            fprintf(stderr, "Error muxing audio packet: %s\n", av_err2str(ret));
                             goto end;
                         }
                         av_packet_unref(output_packet);
@@ -962,7 +506,7 @@ void *process_thread(void *data)
                 // log_packet(ps->plivectx, pkt, 1);
                 int ret = av_interleaved_write_frame(ps->plivectx, pkt);
                 if (ret < 0) {
-                    fprintf(stderr, "Error muxing packet\n");
+                    fprintf(stderr, "Error muxing audio packet: %s\n", av_err2str(ret));
                     break;
                 }
                 av_packet_unref(pkt);
@@ -989,23 +533,23 @@ void *decode_thread(void *data)
     auto onReadData = [](void* pUser, uint8_t* buf, int bufSize)->int
     {
         HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)pUser;
-        HIKEvent_Object *ps = dp->ps;
+        HIKEvent_Object *ps = (HIKEvent_Object *)dp->ps;
 
         while (keepRunning && ESRCH != pthread_kill(ps->decthread_ctx->process_thread, 0))
         {
-            pthread_mutex_lock(&ps->lock);
-            if (TAILQ_EMPTY(&ps->decode_head))
+            pthread_mutex_lock(&dp->lock);
+            if (TAILQ_EMPTY(&dp->decode_head))
             {
-                pthread_mutex_unlock(&ps->lock);
+                pthread_mutex_unlock(&dp->lock);
                 usleep(1000);   // wait 1ms
             } else 
             {
-                struct entry *p = TAILQ_FIRST(&ps->decode_head);
+                struct hik_queue_s *p = TAILQ_FIRST(&dp->decode_head);
                 if ((int)(p->dwBufLen - p->start) < bufSize)
                 {
-                    TAILQ_REMOVE(&ps->decode_head, p, entries);
+                    TAILQ_REMOVE(&dp->decode_head, p, entries);
                 }
-                pthread_mutex_unlock(&ps->lock);
+                pthread_mutex_unlock(&dp->lock);
 
                 size_t wsize = (int)(p->dwBufLen - p->start) > bufSize ? bufSize : (int)(p->dwBufLen - p->start);
                 memcpy(buf, p->data + p->start, wsize);
@@ -1040,44 +584,14 @@ void *decode_thread(void *data)
         return NULL;
     }
 
-    if (!(pFormatCtx = avformat_alloc_context())) {
-        av_freep(&avio_ctx_buffer);
-        fprintf(stderr, "avformat_alloc_context failed");
-        return NULL;
-    }
-
-    dp->pFormatCtx = pFormatCtx;
-    pFormatCtx->pb = pb;
-
-    AVInputFormat *inputFmt = av_find_input_format("mpeg");
-    AVDictionary* opts = nullptr;
-    av_dict_set(&opts, "fflags", "nobuffer", 0);
-    av_dict_set(&opts, "max_analyze_duration", "10", 0);
-    av_dict_set(&opts, "max_delay", "1000", 0);
-    av_dict_set(&opts, "stimeout", "1000000", 0);
-    av_dict_set(&opts, "probesize", "4096", 0);             //加快打开
-    av_dict_set(&opts, "max_probe_packets", "4", 0);             //加快打开
-
-    if (avformat_open_input(&pFormatCtx, NULL, inputFmt, &opts) < 0)
+    pFormatCtx = init_input_ctx(pb);
+    if (pFormatCtx == NULL)
     {
-        if (nullptr != opts)
-            av_dict_free(&opts);
         av_freep(&avio_ctx_buffer);
-        avformat_free_context(pFormatCtx);
-        fprintf(stderr, "avformat_open_input failed\n");
-        return NULL;
+        goto end;
     }
-    if (nullptr != opts)
-        av_dict_free(&opts);
-
-    if (avformat_find_stream_info(pFormatCtx, NULL) < 0) {
-        fprintf(stderr, "Could not find stream information\n");
-        av_freep(&avio_ctx_buffer);
-        avformat_close_input(&pFormatCtx);
-        avformat_free_context(pFormatCtx);
-        return NULL;
-    }
-
+    dp->pFormatCtx = pFormatCtx;
+    
     int ret;
 
     ret = av_find_best_stream(pFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
@@ -1150,15 +664,15 @@ void *decode_thread(void *data)
             continue;
         }
 
-        struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+        struct hik_queue_s *elem = (struct hik_queue_s *)calloc(1, sizeof(struct hik_queue_s));
         if (elem)
         {
             elem->bType = 0;
             elem->data = (char *)pkt;
             elem->dwBufLen = 0;
-            pthread_mutex_lock(&ps->lock);
-            TAILQ_INSERT_TAIL(&ps->push_head, elem, entries);
-            pthread_mutex_unlock(&ps->lock);
+            pthread_mutex_lock(&dp->lock);
+            TAILQ_INSERT_TAIL(&dp->push_head, elem, entries);
+            pthread_mutex_unlock(&dp->lock);
         }
     }
 end:
@@ -1178,94 +692,21 @@ end:
     return NULL;
 }
 
-// GB28181 PSM packet
-typedef struct 
-{
-    unsigned int packet_start_code_prefix:24;
-    unsigned char map_stream_id;
-    unsigned short psm_length;
-    unsigned current_next_indictor  :1;
-    unsigned reserved1              :2;
-    unsigned psm_version            :5;
-    unsigned reserved2              :7;
-    unsigned marker_bit             :1;
-    unsigned char psm_stream_info_len;
-} __attribute__ ((packed)) program_stream_map_t;
-
-// MEPG-1 PSM Header
-typedef struct 
-{
-    uint32_t packet_start_code_prefix:32;   // 00 00 01 ba
-    unsigned reserved1              :4;     // always 0010
-    unsigned sys_clock_ref          :3;
-    unsigned mark1                  :1;     // always set
-    unsigned scr_1                 :8;
-    unsigned scr_2                 :7;
-    unsigned mark2                  :1;     // always set
-    unsigned scr_3                 :8;
-    unsigned scr_4                 :7;
-    unsigned mark3                  :1;
-    unsigned marker_bit             :1;
-    unsigned multiple_rate         :22;
-    unsigned mark4                  :1;
-    unsigned char psm_stream_info_len;
-} __attribute__ ((packed)) mpeg_psm_head_t;
-
-typedef struct
-{
-    unsigned reserved1                     :2;     // always 10
-    unsigned transport_scrambling_control  :2;     // 加扰控制
-    unsigned priority                      :1;
-    unsigned data_locate                   :1;
-    unsigned copyright                     :1;
-    unsigned original_or_copy              :1;
-
-    unsigned PTS_DTS_flags                 :2;
-    unsigned ESCR_flag                     :1;
-    unsigned ES_rate_flag                  :1;
-    unsigned DSM_trick_mode_flag           :1;
-    unsigned additional_copy_info_flag     :1;
-    unsigned PES_CRC_flag                  :1;
-    unsigned PES_extension_flag            :1;
-
-    unsigned char PES_header_data_length;
-} __attribute__ ((packed)) mpeg_pes_head_t;
-
-typedef struct {
-    unsigned PES_private_data_flag              :1;
-    unsigned pack_header_field_flag             :1;
-    unsigned program_packet_sequence_counter_flag :1;
-    unsigned P_STD_buffer_flag       :1;
-    unsigned reserved                :3;
-    unsigned PES_extension_flag_2    :1;
-} __attribute__ ((packed)) mpeg_pes_extension_t;
-
-void dump_hex(unsigned char *buf, DWORD len)
-{
-    for (DWORD i = 0; i < len; i++) {
-        if (i % 16 == 0)
-        {
-            printf("\n%08x: ", i);
-        }
-        printf("%02x ", buf[i]);
-    }
-        printf("\n");
-}
 
 void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *pBuffer,DWORD dwBufSize,void* dwUser) {
     HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)dwUser;
-    HIKEvent_Object *ps = dp->ps;
+    HIKEvent_Object *ps = (HIKEvent_Object *)dp->ps;
     // int dRet;
 
     switch (dwDataType) {
         case NET_DVR_SYSHEAD: //系统头
         case NET_DVR_AUDIOSTREAMDATA:   // 音频数据
         {
-            printf("dwDataType: NET_DVR_AUDIOSTREAMDATA\n");
-            struct entry *elem;
+            fprintf(stderr, "dwDataType: NET_DVR_AUDIOSTREAMDATA\n");
+            struct hik_queue_s *elem;
             char *buf;
 
-            elem = (struct entry *)calloc(1, sizeof(struct entry));
+            elem = (struct hik_queue_s *)calloc(1, sizeof(struct hik_queue_s));
             if (!elem) {
                 fprintf(stderr, "allocate storage element failed\n");
                 return;
@@ -1276,9 +717,9 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
             elem->bType = 0;
             memcpy(buf, pBuffer, dwBufSize);
             elem->dwBufLen += dwBufSize;
-            pthread_mutex_lock(&ps->lock);
-            TAILQ_INSERT_TAIL(&ps->decode_head, elem, entries);
-            pthread_mutex_unlock(&ps->lock);
+            pthread_mutex_lock(&dp->lock);
+            TAILQ_INSERT_TAIL(&dp->decode_head, elem, entries);
+            pthread_mutex_unlock(&dp->lock);
             break;
         }
         case NET_DVR_STREAMDATA: //码流数据
@@ -1304,9 +745,22 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 }
             } else 
             {
-                printf("ERR %d\n", psm->packet_start_code_prefix);
-                for (DWORD i = 0; i < dwBufSize; i++) printf("%02x ", pBuffer[i]);
-                    printf("\n");
+                // fprintf(stderr, "ERR %d\n", psm->packet_start_code_prefix);
+                ps->rx_size += dwBufSize;
+                struct hik_queue_s *elem = (struct hik_queue_s *)calloc(1, sizeof(struct hik_queue_s));
+                if (elem)
+                {
+                    elem->bType = 0;
+                    elem->data = (char *)malloc(dwBufSize);
+                    memcpy(elem->data, pBuffer, dwBufSize);
+                    elem->dwBufLen = dwBufSize;
+                    pthread_mutex_lock(&dp->lock);
+                    TAILQ_INSERT_TAIL(&dp->decode_head, elem, entries);
+                    pthread_mutex_unlock(&dp->lock);
+                }
+                break;
+                // for (DWORD i = 0; i < dwBufSize; i++) printf("%02x ", pBuffer[i]);
+                //     printf("\n");
             }
 
             if (psm->packet_start_code_prefix == 0x010000)
@@ -1315,9 +769,9 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 {
                     case 0xc0:  // Audio
                         ps->rx_size += dwBufSize;
-                        if (dp->ps->transcode == -1 && dwBufSize == 96)
+                        if (ps->transcode == -1 && dwBufSize == 96)
                         {
-                            mpeg_pes_head_t *pes_head = (mpeg_pes_head_t *)(pBuffer + 6);
+                            // mpeg_pes_head_t *pes_head = (mpeg_pes_head_t *)(pBuffer + 6);
 
                             /* frame containing input raw audio */
                             AVFrame *frame = av_frame_alloc();
@@ -1352,15 +806,15 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                                 fprintf(stderr, "NET_DVR_DecodeG722Frame error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
                             }
 
-                            struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+                            struct hik_queue_s *elem = (struct hik_queue_s *)calloc(1, sizeof(struct hik_queue_s));
                             if (elem)
                             {
                                 elem->bType = 1;
                                 elem->data = (char *)frame;
                                 elem->dwBufLen = 0;
-                                pthread_mutex_lock(&ps->lock);
-                                TAILQ_INSERT_TAIL(&ps->push_head, elem, entries);
-                                pthread_mutex_unlock(&ps->lock);
+                                pthread_mutex_lock(&dp->lock);
+                                TAILQ_INSERT_TAIL(&dp->push_head, elem, entries);
+                                pthread_mutex_unlock(&dp->lock);
                             }
 
                             break;
@@ -1372,27 +826,27 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                         // unsigned short psm_stream_info_len = htons(psm->psm_stream_info_len);
                         // unsigned short stream_map_length = htons(*(uint16_t *)(pBuffer + sizeof(program_stream_map_t) + psm->psm_stream_info_len));
                         // printf("rx video psm_stream_info_len: %d  stream_map_length: %d data size %d\n", psm_stream_info_len, stream_map_length, dwBufSize);
-                        struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+                        struct hik_queue_s *elem = (struct hik_queue_s *)calloc(1, sizeof(struct hik_queue_s));
                         if (elem)
                         {
                             elem->bType = 0;
                             elem->data = (char *)malloc(dwBufSize);
                             memcpy(elem->data, pBuffer, dwBufSize);
                             elem->dwBufLen = dwBufSize;
-                            pthread_mutex_lock(&ps->lock);
-                            TAILQ_INSERT_TAIL(&ps->decode_head, elem, entries);
-                            pthread_mutex_unlock(&ps->lock);
+                            pthread_mutex_lock(&dp->lock);
+                            TAILQ_INSERT_TAIL(&dp->decode_head, elem, entries);
+                            pthread_mutex_unlock(&dp->lock);
                         }
                         break;
                     }
                     case 0xbc:  // PSM Header
                         // https://blog.csdn.net/fanyun_01/article/details/120537670
-                        printf("rx data  %08x \n", htonl(*(uint32_t *)pBuffer));
+                        fprintf(stderr, "rx data  %08x \n", htonl(*(uint32_t *)pBuffer));
                         break;
                     case 0xbd:  // Private Stream Data
                         break;
                     default:
-                        printf("rx data  %08x \n", htonl(*(uint32_t *)pBuffer));
+                        fprintf(stderr, "rx data  %08x \n", htonl(*(uint32_t *)pBuffer));
                 }
             }
             break; 
@@ -1407,10 +861,11 @@ int main(int argc, char **argv)
 {
     AVIOContext *pOutputIO = nullptr;
     HIKEvent_Object *ps = (HIKEvent_Object *)calloc(1, sizeof(HIKEvent_Object));
+    global_ps = ps;
     ps->transcode = 1;
 
     av_log_set_level( AV_LOG_DEBUG);
-	char c;
+    char c;
     while ((c = getopt_long(argc, argv, shortopts, longopts, NULL)) != -1) {
         switch (c) {
         case 'h':
@@ -1432,21 +887,25 @@ int main(int argc, char **argv)
             ps->transcode = 0;
             break;
         case 'v':
-            ps->debug_packet = 1;
+            ps->debug_packet = 3;
+            break;
+        case 'P':
+            ps->playback = atoi(optarg);
             break;
         case '?': // 输入未定义的选项, 都会将该选项的值变为 ?
             fprintf(stderr, "Usage: hikrtmp -h <host> -u <user> -p <passwd> -c <camera channel> [-s <stream type>] [-Nvh] <rtmp url>\n");
             fprintf(stderr, "Convert Hikvision PS stream to RTMP\n");
             fprintf(stderr, "  \n");
             fprintf(stderr, "Options:\n");
-            fprintf(stderr, "  -h --host            NVR/DVR/Camera IP\n");
-            fprintf(stderr, "  -u --user            NVR/DVR/Camera Username\n");
-            fprintf(stderr, "  -p --passwd          NVR/DVR/Camera Password\n");
-            fprintf(stderr, "  -c --camera          NVR/DVR/Camera Camera Channel\n");
-            fprintf(stderr, "  -s --stream-type     NVR/DVR/Camera Stream Type (0: Main Stream 1: Sub Stream...)\n");
-            fprintf(stderr, "  -N --ignore-acodec   Copy acodec without transcode to AAC\n");
-            fprintf(stderr, "  -v --verbose         Log frames\n");
-            fprintf(stderr, "  -? --help            Show help\n\n");
+            fprintf(stderr, "  -h --host <str:host>      NVR/DVR/Camera IP\n");
+            fprintf(stderr, "  -u --user <str:user>      NVR/DVR/Camera Username\n");
+            fprintf(stderr, "  -p --passwd <str:pw>      NVR/DVR/Camera Password\n");
+            fprintf(stderr, "  -c --camera <int:cam>     NVR/DVR/Camera Camera Channel\n");
+            fprintf(stderr, "  -s --stream-type <int:s>  NVR/DVR/Camera Stream Type (0: Main Stream 1: Sub Stream...)\n");
+            fprintf(stderr, "  -N --ignore-acodec        Copy acodec without transcode to AAC\n");
+            fprintf(stderr, "  -v --verbose              Log frames\n");
+            fprintf(stderr, "  -P --playback <int:ts>    Playback timestamp\n");
+            fprintf(stderr, "  -? --help                 Show help\n\n");
             // fprintf(stderr,"unknown option \n");
             break;
         default:
@@ -1459,20 +918,18 @@ int main(int argc, char **argv)
     argv += optind;
     if (argc == 0)
     {
-    	fprintf(stderr, "no rtmp url\n");
-    	return 1;
+        fprintf(stderr, "no rtmp url\n");
+        return 1;
     }
-    printf("rtmp url: %s\n", argv[0]);
+    fprintf(stderr, "rtmp url: %s\n", argv[0]);
 
     signal(SIGINT, intHandler);
+    signal(SIGUSR1, debugHandler);
 
     if (pthread_mutex_init(&ps->lock, NULL) != 0) {
         fprintf(stderr, "mutex init has failed");
         return 1;
     }
-
-    TAILQ_INIT(&ps->decode_head);
-    TAILQ_INIT(&ps->push_head);
 
     // 初始化
     NET_DVR_Init();
@@ -1495,17 +952,28 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    ps->decthread_ctx = (HIKEvent_DecodeThread *)calloc(1, sizeof(HIKEvent_DecodeThread));
+    ps->decthread_ctx = init_decode_ctx();
     ps->decthread_ctx->ps = ps;
     pthread_create(&ps->decthread_ctx->thread, NULL, decode_thread, ps->decthread_ctx);
     pthread_create(&ps->decthread_ctx->process_thread, NULL, process_thread, ps->decthread_ctx);
 
     int error;
-    if ((error = avio_open(&pOutputIO, argv[0],
-                           AVIO_FLAG_READ_WRITE)) < 0) {
-        fprintf(stderr, "Could not open output file '%s' (error)\n",
-                argv[0]);
-        return error;
+    if (strcmp(argv[0],"-") == 0)
+    {
+        if ((error = avio_open(&pOutputIO, "pipe:1",
+                               AVIO_FLAG_READ_WRITE)) < 0) {
+            fprintf(stderr, "Could not open output file '%s' (error)\n",
+                    argv[0]);
+            return error;
+        }
+    } else 
+    {
+        if ((error = avio_open(&pOutputIO, argv[0],
+                               AVIO_FLAG_READ_WRITE)) < 0) {
+            fprintf(stderr, "Could not open output file '%s' (error)\n",
+                    argv[0]);
+            return error;
+        }
     }
 
     /* Create a new format context for the output container format. */
@@ -1567,22 +1035,85 @@ int main(int argc, char **argv)
 
     //     return pErrorNo;
     // }
-    
-    NET_DVR_PREVIEWINFO struPlayInfo = {0};
-    struPlayInfo.hPlayWnd     = 0;  // 仅取流不解码。这是Linux写法，Windows写法是struPlayInfo.hPlayWnd = NULL;
-    struPlayInfo.lChannel     = cameraNo; // 通道号
-    struPlayInfo.dwStreamType = streamType;  // 0- 主码流，1-子码流，2-码流3，3-码流4，以此类推
-    struPlayInfo.dwLinkMode   = 0;  // 0- TCP方式，1- UDP方式，2- 多播方式，3- RTP方式，4-RTP/RTSP，5-RSTP/HTTP
-    struPlayInfo.bBlocked     = 1;  // 0- 非阻塞取流，1- 阻塞取流
-    //struPlayInfo.dwDisplayBufNum = 1;
 
-    long lRealPlayHandle = NET_DVR_RealPlay_V40(ps->lUserID, &struPlayInfo, g_RealDataCallBack_V30, ps->decthread_ctx); // NET_DVR_RealPlay_V40 实时预览（支持多码流）。
-    //lRealPlayHandle = NET_DVR_RealPlay_V30(lUserID, &ClientInfo, NULL, NULL, 0); // NET_DVR_RealPlay_V30 实时预览。
-    if (lRealPlayHandle < 0) {
-        LONG pErrorNo = NET_DVR_GetLastError();
-        fprintf(stderr, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
-        NET_DVR_Cleanup();
-        return 1;
+    long lRealPlayHandle = 0;
+    
+    if (ps->playback)
+    {
+        struct tm *tp = localtime((const time_t *)&ps->playback);
+
+        NET_DVR_VOD_PARA_V50 struPlayback = {0};
+        memset(&struPlayback, 0, sizeof(struPlayback));
+        struPlayback.dwSize = sizeof(struPlayback);
+        struPlayback.struIDInfo.dwSize = sizeof(NET_DVR_STREAM_INFO);
+        struPlayback.struIDInfo.dwChannel = cameraNo;
+
+        struPlayback.struBeginTime.wYear = 1900 + tp->tm_year;
+        struPlayback.struBeginTime.byMonth = 1 + tp->tm_mon;
+        struPlayback.struBeginTime.byDay = tp->tm_mday;
+        struPlayback.struBeginTime.byHour = tp->tm_hour;
+        struPlayback.struBeginTime.byMinute = tp->tm_min;
+        struPlayback.struBeginTime.bySecond = tp->tm_sec;
+
+        struPlayback.struEndTime.wYear = 1900 + tp->tm_year;
+        struPlayback.struEndTime.byMonth = 1 + tp->tm_mon;
+        struPlayback.struEndTime.byDay = tp->tm_mday;
+        struPlayback.struEndTime.byHour = tp->tm_hour + 1;
+        struPlayback.struEndTime.byMinute = tp->tm_min;
+        struPlayback.struEndTime.bySecond = tp->tm_sec;
+
+        fprintf(stderr, "Playback Time：%s", asctime(tp));
+        // struPlayback.struEndTime.wYear = 2021;
+        // struPlayback.struEndTime.byMonth = 4;
+        // struPlayback.struEndTime.byDay = 7;
+        // struPlayback.struEndTime.byHour = 10;
+        // struPlayback.struEndTime.byMinute = 0;
+        // struPlayback.struEndTime.bySecond = 0;
+
+        //按时间回放
+        lRealPlayHandle = NET_DVR_PlayBackByTime_V50(ps->lUserID, &struPlayback);
+        if (lRealPlayHandle < 0)
+        {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            fprintf(stderr, "NET_DVR_PlayBackByTime_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            goto cleanup;
+        }
+
+        if (!NET_DVR_SetPlayDataCallBack_V40(lRealPlayHandle, g_RealDataCallBack_V30, ps->decthread_ctx))
+        {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            fprintf(stderr, "NET_DVR_SetPlayDataCallBack_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            goto cleanup;
+        }
+
+        //---------------------------------------
+        //开始
+        if (!NET_DVR_PlayBackControl_V40(lRealPlayHandle, NET_DVR_PLAYSTART, NULL, 0, NULL, NULL))
+        {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            fprintf(stderr, "NET_DVR_PlayBackControl_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            goto cleanup;
+        }
+
+        // NET_DVR_PlayBackByTime_V50
+    } else 
+    {
+        NET_DVR_PREVIEWINFO struPlayInfo = {0};
+        struPlayInfo.hPlayWnd     = 0;  // 仅取流不解码。这是Linux写法，Windows写法是struPlayInfo.hPlayWnd = NULL;
+        struPlayInfo.lChannel     = cameraNo; // 通道号
+        struPlayInfo.dwStreamType = streamType;  // 0- 主码流，1-子码流，2-码流3，3-码流4，以此类推
+        struPlayInfo.dwLinkMode   = 0;  // 0- TCP方式，1- UDP方式，2- 多播方式，3- RTP方式，4-RTP/RTSP，5-RSTP/HTTP
+        struPlayInfo.bBlocked     = 1;  // 0- 非阻塞取流，1- 阻塞取流
+        //struPlayInfo.dwDisplayBufNum = 1;
+
+        lRealPlayHandle = NET_DVR_RealPlay_V40(ps->lUserID, &struPlayInfo, g_RealDataCallBack_V30, ps->decthread_ctx); // NET_DVR_RealPlay_V40 实时预览（支持多码流）。
+        //lRealPlayHandle = NET_DVR_RealPlay_V30(lUserID, &ClientInfo, NULL, NULL, 0); // NET_DVR_RealPlay_V30 实时预览。
+        if (lRealPlayHandle < 0) {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            fprintf(stderr, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            NET_DVR_Cleanup();
+            return 1;
+        }
     }
     
     ps->last_reset = microtime();
@@ -1591,20 +1122,33 @@ int main(int argc, char **argv)
         double now = microtime();
         if (now - ps->last_reset > 1)
         {
-            printf("rx %-10d bytes  %.2f kbps  tx %.2f kbps      \n", ps->rx_size, ps->rx_size * 8.0 / 1024 / (now - ps->last_reset), ps->tx_size * 8.0 / 1024 / (now - ps->last_reset));
-            fflush(stdout);
+            // printf("rx %-10d bytes  %.2f kbps  tx %.2f kbps      \n", ps->rx_size, ps->rx_size * 8.0 / 1024 / (now - ps->last_reset), ps->tx_size * 8.0 / 1024 / (now - ps->last_reset));
+            // fflush(stdout);
             ps->rx_size = 0;
             ps->tx_size = 0;
             ps->last_reset = now;
         }
         usleep(100000);   // wait 100ms
     }
-    if (false == NET_DVR_StopRealPlay(lRealPlayHandle)) {    // 停止取流
-        LONG pErrorNo = NET_DVR_GetLastError();
-        fprintf(stderr, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
-        NET_DVR_Cleanup();
-        return 1;
+    if (ps->playback)
+    {
+        //停止回放
+        if (!NET_DVR_StopPlayBack(lRealPlayHandle))
+        {
+            fprintf(stderr, "failed to stop file [%d]\n", NET_DVR_GetLastError());
+            goto cleanup;
+        }
+    } else 
+    {
+        if (false == NET_DVR_StopRealPlay(lRealPlayHandle)) {    // 停止取流
+            LONG pErrorNo = NET_DVR_GetLastError();
+            fprintf(stderr, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            NET_DVR_Cleanup();
+            return 1;
+        }
     }
+cleanup:
+    keepRunning = false;
 
     if (ps->plivectx && ps->decthread_ctx->outputHeaderWrite)
         av_write_trailer(ps->plivectx);
@@ -1616,5 +1160,8 @@ int main(int argc, char **argv)
     if (ps->decthread_ctx->g722_decoder)
         NET_DVR_ReleaseG722Decoder(ps->decthread_ctx->g722_decoder);
 
-	return 0;
+    NET_DVR_Logout(ps->lUserID);
+    NET_DVR_Cleanup();
+    
+    return 0;
 }

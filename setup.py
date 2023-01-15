@@ -7,7 +7,7 @@ import pkgconfig
 
 d = pkgconfig.parse('libavcodec libavformat libavutil libswresample libswscale')
 
-hello_module = Extension('hikevent', sources = ['hikevent.cpp'],
+hello_module = Extension('hikevent', sources = ['hikevent.cpp', 'hikbase.c'],
                          include_dirs=d['include_dirs'] + ['include'],
                          library_dirs=d['library_dirs'] + ['lib'],
                          libraries=d['libraries'] + ['hcnetsdk','HCCore','PlayCtrl','AudioRender', 'SuperRender'],
