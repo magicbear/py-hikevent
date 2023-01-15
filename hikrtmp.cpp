@@ -46,11 +46,6 @@ static struct option longopts[] = {
 
 static volatile int keepRunning = 1;
 
-void intHandler(int dummy) {
-    keepRunning = 0;
-}
-
-
 typedef struct {
     char *ip;
     char *user;
@@ -59,11 +54,9 @@ typedef struct {
     LONG lUserID;
     LONG lHandle;
     NET_DVR_DEVICEINFO_V30 struDeviceInfo;
-    NET_DVR_COMPRESSION_AUDIO compressAudioType;
     NET_DVR_USER_LOGIN_INFO struLoginInfo = {0};
     NET_DVR_DEVICEINFO_V40 struDeviceInfoV40 = {0};
 
-    int transcode;
     int debug_packet;
 
     time_t   playback;
@@ -75,7 +68,6 @@ typedef struct {
 
     pthread_mutex_t lock;
 
-    AVFormatContext *plivectx = nullptr;
     /* Type-specific fields go here. */
 } HIKEvent_Object;
 
@@ -84,443 +76,21 @@ static volatile HIKEvent_Object *global_ps = NULL;
 
 void debugHandler(int dummy) {
     if (global_ps != NULL)
+    {
         global_ps->debug_packet = (global_ps->debug_packet + 1) % 4;
+        global_ps->decthread_ctx->debug_packet = global_ps->debug_packet;
+    }
 }
 
 
-int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st)
-{
-    HIKEvent_Object *ps = (HIKEvent_Object *)dp->ps;
-    int ret = 0;
-    AVCodec *enc_codec;
-
-    fprintf(stderr, "init audio encoder  Audio Encode Type: %d\n", ps->compressAudioType.byAudioEncType);
-
-    int sampleRate = ps->compressAudioType.byAudioSamplingRate;
-    switch(ps->compressAudioType.byAudioSamplingRate)
+void intHandler(int dummy) {
+    keepRunning = 0;
+    if (global_ps != NULL)
     {
-        case 1: sampleRate = 16000; break;
-        case 2: sampleRate = 32000; break;
-        case 3: sampleRate = 48000; break;
-        case 4: sampleRate = 44100; break;
-        case 5: sampleRate = 8000; break;
-        default: sampleRate = 8000;
+        global_ps->decthread_ctx->stop = 1;
     }
-    switch (ps->compressAudioType.byAudioEncType)
-    {
-    case 0: // Note: Not support
-    case 9:
-        ps->transcode = -1;
-        // st->codecpar->codec_id = AV_CODEC_ID_ADPCM_G722;
-        sampleRate = 16000;
-        st->codecpar->codec_id = AV_CODEC_ID_PCM_S16LE;
-        break;
-    case 1: st->codecpar->codec_id = AV_CODEC_ID_PCM_MULAW; break;
-    case 2: st->codecpar->codec_id = AV_CODEC_ID_PCM_ALAW; break;
-    case 5: st->codecpar->codec_id = AV_CODEC_ID_MP2; break;
-    case 6: st->codecpar->codec_id = AV_CODEC_ID_ADPCM_G726LE; break;
-    case 7: st->codecpar->codec_id = AV_CODEC_ID_AAC; break;
-    case 8: st->codecpar->codec_id = AV_CODEC_ID_PCM_S16LE; break;
-    case 10:
-        st->codecpar->codec_id = AV_CODEC_ID_G723_1; break;
-    case 11:
-        st->codecpar->codec_id = AV_CODEC_ID_G729; break;
-    case 15: st->codecpar->codec_id = AV_CODEC_ID_MP3; break;
-    // case 16: st->codecpar->codec_id = AV_CODEC_ID_ADPCM; break;
-    }
-    
-    st->codecpar->sample_rate = sampleRate;
-    st->codecpar->channels = 1;
-    st->codecpar->channel_layout = av_get_default_channel_layout(st->codecpar->channels);
-
-    AVCodec *dec = avcodec_find_decoder(st->codecpar->codec_id);
-    if (!dec) {
-        fprintf(stderr, "Failed to find %s codec\n",
-                av_get_media_type_string(AVMEDIA_TYPE_AUDIO));
-        goto end;
-    }
-
-    dp->dec_ctx = avcodec_alloc_context3(dec);
-    if (!dp->dec_ctx) {
-        fprintf(stderr, "Failed to allocate the %s codec context\n",
-                av_get_media_type_string(AVMEDIA_TYPE_AUDIO));
-        goto end;
-    }
-
-    /* Copy codec parameters from input stream to output codec context */
-    if ((ret = avcodec_parameters_to_context(dp->dec_ctx, st->codecpar)) < 0) {
-        fprintf(stderr, "Failed to copy %s codec parameters to decoder context\n",
-                av_get_media_type_string(AVMEDIA_TYPE_AUDIO));
-        goto end;
-    }
-
-    /* Init the decoders */
-    if ((ret = avcodec_open2(dp->dec_ctx, dec, NULL)) < 0) {
-        fprintf(stderr, "Failed to open %s codec\n",
-                av_get_media_type_string(AVMEDIA_TYPE_AUDIO));
-        goto end;
-    }
-
-
-    if (ps->transcode)
-    {
-        enc_codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
-        // enc_codec = avcodec_find_encoder(AV_CODEC_ID_PCM_S16LE);
-        if (!enc_codec) {
-            fprintf(stderr, "Codec not found\n");
-            goto end;
-        }
-        dp->enc_ctx = avcodec_alloc_context3(enc_codec);
-        if (!dp->enc_ctx) {
-            fprintf(stderr, "Failed to allocate the %s codec context\n",
-                    av_get_media_type_string(AVMEDIA_TYPE_AUDIO));
-            goto end;
-        }
-        // dp->enc_ctx->bit_rate = 96000;
-        dp->enc_ctx->sample_fmt = enc_codec->sample_fmts[0];
-        dp->enc_ctx->sample_rate = 44100;
-        dp->enc_ctx->channels    = 1;
-        dp->enc_ctx->channel_layout = av_get_default_channel_layout(1);
-        dp->enc_ctx->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
-        dp->enc_ctx->time_base = (AVRational){1, dp->enc_ctx->sample_rate};
-
-        dp->src_rate = st->codecpar->sample_rate;
-        dp->dst_rate = dp->enc_ctx->sample_rate;
-
-        // Set up SWR context once you've got codec information
-        dp->swr = swr_alloc();
-        av_opt_set_int(dp->swr, "in_channel_layout",  av_get_default_channel_layout(dp->dec_ctx->channels), 0);
-        av_opt_set_int(dp->swr, "out_channel_layout", av_get_default_channel_layout(dp->enc_ctx->channels),  0);
-        av_opt_set_int(dp->swr, "in_sample_rate",     dp->src_rate, 0);
-        av_opt_set_int(dp->swr, "out_sample_rate",    dp->enc_ctx->sample_rate, 0);
-        av_opt_set_sample_fmt(dp->swr, "in_sample_fmt",  dp->dec_ctx->sample_fmt, 0);
-        av_opt_set_sample_fmt(dp->swr, "out_sample_fmt", dp->enc_ctx->sample_fmt,  0);
-        swr_init(dp->swr);
-
-        /* open it */
-        if ((ret = avcodec_open2(dp->enc_ctx, enc_codec, NULL)) < 0) {
-            fprintf(stderr, "Could not open encode codec\n");
-            goto end;
-        }
-
-        if (!(dp->fifo = av_audio_fifo_alloc(dp->enc_ctx->sample_fmt,
-                                          dp->enc_ctx->channels, 1))) {
-            ret = -1;
-            fprintf(stderr, "Could not allocate FIFO\n");
-            goto end;
-        }
-    }
-
-    dp->out_astream = avformat_new_stream(ps->plivectx, NULL);
-    if (!dp->out_astream) {
-        ret = -1;
-        fprintf(stderr, "Failed allocating output stream\n");
-        goto end;
-    }
-
-    if (dp->enc_ctx)
-    {
-        ret = avcodec_parameters_from_context(dp->out_astream->codecpar, dp->enc_ctx);
-        if (ret < 0) {
-            fprintf(stderr, "Failed to copy codec parameters\n");
-            goto end;
-        }
-        // dp->out_astream->codecpar->codec_tag = 0;
-    } else 
-    {
-        ret = avcodec_parameters_copy(dp->out_astream->codecpar, st->codecpar);
-        if (ret < 0) {
-            fprintf(stderr, "Failed to copy codec parameters\n");
-            return 1;
-        }
-        dp->out_astream->codecpar->codec_tag = 0;
-    }
-
-    av_dump_format(dp->pFormatCtx, 0, NULL, 0);
-    av_dump_format(ps->plivectx, 0, NULL, 1);
-    
-    if (!dp->outputHeaderWrite)
-    {
-        dp->outputHeaderWrite = true;
-        fprintf(stderr, "Output: Write header\n");
-        ret = avformat_write_header(ps->plivectx, NULL);
-        if (ret < 0) {
-            fprintf(stderr, "Error occurred when opening output file\n");
-            goto end;
-        }
-    }
-    fprintf(stderr, "init audio encoder ok\n");
-    return ret;
-end:
-    if (dp->dec_ctx)
-    {
-        avcodec_free_context(&dp->dec_ctx);
-        dp->dec_ctx = NULL;
-    }
-    if (dp->enc_ctx)
-    {
-        avcodec_free_context(&dp->enc_ctx);
-        dp->enc_ctx = NULL;
-    }
-    if (dp->fifo)
-    {
-        av_audio_fifo_free(dp->fifo);
-        dp->fifo = NULL;
-    }
-    if (dp->swr){
-        swr_free(&dp->swr);
-        dp->swr = NULL;
-    }
-
-    return ret;
 }
 
-void *process_thread(void *data)
-{
-    HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)data;
-    HIKEvent_Object *ps = (HIKEvent_Object *)dp->ps;
-    AVPacket *output_packet = NULL;
-    int ret = 0;
-    int bType = 0;
-
-    while (keepRunning)
-    {
-        AVPacket *pkt = NULL;
-        pthread_mutex_lock(&dp->lock);
-        if (TAILQ_EMPTY(&dp->push_head) || !dp->probedone)
-        {
-            pthread_mutex_unlock(&dp->lock);
-            usleep(1000);
-            continue;
-        } else 
-        {
-            struct hik_queue_s *p = NULL;
-            p = TAILQ_FIRST(&dp->push_head);
-            bType = p->bType;
-            pkt = (AVPacket *)p->data;
-            TAILQ_REMOVE(&dp->push_head, p, entries);
-            pthread_mutex_unlock(&dp->lock);
-            free(p);
-        }
-
-        AVFormatContext *pFormatCtx = dp->pFormatCtx;
-        AVStream *in_stream = NULL;
-
-        if (bType == 0)
-        {
-            in_stream = pFormatCtx->streams[pkt->stream_index];
-        } else 
-        {
-            in_stream = pFormatCtx->streams[1];
-        }
-        if (in_stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
-        {
-            AVStream *out_stream = dp->out_vstream;
-            if (dp->out_astream == NULL)
-            {
-                log_packet(pFormatCtx, pkt, 2);
-                av_packet_unref(pkt);
-                av_packet_free(&pkt);
-                continue;
-            }
-            // if (!dp->outputHeaderWrite)
-            // {
-            //     dp->outputHeaderWrite = true;
-            //     fprintf(stderr, "Output: Write header\n");
-            //     ret = avformat_write_header(ps->plivectx, NULL);
-            //     if (ret < 0) {
-            //         fprintf(stderr, "Error occurred when opening output file\n");
-            //         goto end;
-            //     }
-            // }
-            if (ps->debug_packet & 0x1)
-                log_packet(pFormatCtx, pkt, 0);
-            /* copy packet */
-            av_packet_rescale_ts(pkt, in_stream->time_base, dp->out_vstream->time_base);
-            if (dp->video_pts)
-            {
-                pkt->pts += dp->video_pts;
-            }
-            dp->global_pts = pkt->pts;
-            pkt->pos = -1;
-            pkt->stream_index = out_stream->index;
-
-            ps->tx_size += pkt->buf ? pkt->buf->size : 0;
-            if (ps->debug_packet & 0x2)
-                log_packet(ps->plivectx, pkt, 1);
-            ret = av_interleaved_write_frame(ps->plivectx, pkt);
-            if (ret < 0) {
-                fprintf(stderr, "Error muxing video packet: %s\n", av_err2str(ret));
-                break;
-            }
-            av_packet_unref(pkt);
-            av_packet_free(&pkt);
-        } else if (in_stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
-        {
-            if (dp->out_astream == NULL && init_audio_decoder(dp, in_stream))
-            {
-                break;
-            }
-            int finished                = 0;
-            int dst_nb_samples          = 0;
-
-            if (ps->transcode)
-            {
-                /* Decode one frame worth of audio samples, convert it to the
-                     * output sample format and put it into the FIFO buffer. */
-                if (bType == 0)
-                {
-                    if (read_decode_convert_and_store(dp, pkt, &dst_nb_samples, &finished))
-                        goto end;
-                    if (ps->debug_packet & 0x1)
-                        log_packet(pFormatCtx, pkt, 0);
-                    av_packet_unref(pkt);
-                    av_packet_free(&pkt);
-                } else 
-                {
-                    AVFrame *frame = (AVFrame *)pkt;
-                    if (convert_and_store(dp, frame, &dst_nb_samples, &finished))
-                        goto end;
-                    av_frame_free(&frame);
-                }
-                
-                double audio_t = dp->audio_pts * av_q2d(dp->enc_ctx->time_base);
-                double video_t = dp->global_pts * av_q2d(dp->out_vstream->time_base);
-                if (audio_t > video_t + 1)
-                {
-                    fprintf(stderr, "ERROR: NOT SYNC Audio, reset audio buffer  audio pts = %" PRId64 "/%.6f  video pts = %" PRId64 "/%.6f\n", 
-                        dp->audio_pts,
-                        dp->audio_pts * av_q2d(dp->enc_ctx->time_base), 
-                        dp->global_pts,
-                        dp->global_pts * av_q2d(dp->out_vstream->time_base));
-                    av_audio_fifo_reset(dp->fifo);
-                    continue;
-                } else if (dp->audio_pts != 0 && audio_t < video_t - 1)
-                {
-                    fprintf(stderr, "ERROR: NOT SYNC Video, reset audio pts  audio pts = %" PRId64 "/%.6f  video pts = %" PRId64 "/%.6f\n", 
-                        dp->audio_pts,
-                        dp->audio_pts * av_q2d(dp->enc_ctx->time_base), 
-                        dp->global_pts,
-                        dp->global_pts * av_q2d(dp->out_vstream->time_base));
-                    dp->audio_pts = 0;
-                }
-
-                if (dp->audio_pts == 0)
-                {
-                    if (dp->global_pts)
-                    {
-                        dp->audio_pts = av_rescale_q_rnd(dp->global_pts, dp->out_vstream->time_base, dp->enc_ctx->time_base, AV_ROUND_UP);
-                    } else 
-                    {
-                        // Wait global pts, cache the audio frame to FIFO queue
-                        // dp->audio_pts = av_rescale_q_rnd(pkt->pts, in_stream->time_base, dp->enc_ctx->time_base, AV_ROUND_UP);
-                        av_audio_fifo_reset(dp->fifo);
-                        continue;
-                    }
-                }
-                /* Use the encoder's desired frame size for processing. */
-                // 
-                const int output_frame_size = dp->enc_ctx->frame_size == 0 ? dst_nb_samples : dp->enc_ctx->frame_size;
-
-                /* Make sure that there is one frame worth of samples in the FIFO
-                 * buffer so that the encoder can do its work.
-                 * Since the decoder's and the encoder's frame size may differ, we
-                 * need to FIFO buffer to store as many frames worth of input samples
-                 * that they make up at least one frame worth of output samples. */
-                if (av_audio_fifo_size(dp->fifo) < output_frame_size) {
-                    /* If we are at the end of the input file, we continue
-                     * encoding the remaining audio samples to the output file. */
-                    if (finished)
-                        break;
-                }
-
-                /* If we have enough samples for the encoder, we encode them.
-                 * At the end of the file, we pass the remaining samples to
-                 * the encoder. */
-                while (av_audio_fifo_size(dp->fifo) >= output_frame_size ||
-                       (finished && av_audio_fifo_size(dp->fifo) > 0))
-                {
-                    if (!keepRunning)
-                        break;
-                    /* Temporary storage of the output samples of the frame written to the file. */
-                    AVFrame *output_frame;
-
-                    /* Use the maximum number of possible samples per frame.
-                     * If there is less than the maximum possible frame size in the FIFO
-                     * buffer use this number. Otherwise, use the maximum possible frame size. */
-                    const int frame_size = FFMIN(av_audio_fifo_size(dp->fifo),
-                                                 output_frame_size);
-                    int data_written;
-
-                    /* Initialize temporary storage for one output frame. */
-                    if (init_output_frame(&output_frame, dp->enc_ctx, frame_size))
-                        goto end;
-
-                    /* Read as many samples from the FIFO buffer as required to fill the frame.
-                     * The samples are stored in the frame temporarily. */
-                    if (av_audio_fifo_read(dp->fifo, (void **)output_frame->data, frame_size) < frame_size) {
-                        fprintf(stderr, "Could not read data from FIFO\n");
-                        av_frame_free(&output_frame);
-                        goto end;
-                    }
-
-                    output_packet = av_packet_alloc();
-                    /* Encode one frame worth of audio samples. */
-                    if (encode_audio_frame(dp, output_frame, &output_packet,
-                                           dp->enc_ctx, &data_written)) {
-                        av_frame_free(&output_frame);
-                        goto end;
-                    }
-                    if (data_written)
-                    {
-                        output_packet->pos = -1;
-                        output_packet->stream_index = dp->out_astream->index;
-
-                        // Translate Encode timebase to outstream timebase
-                        av_packet_rescale_ts(output_packet, dp->enc_ctx->time_base, dp->out_astream->time_base);
-
-                        if (ps->debug_packet & 0x2)
-                            log_packet(ps->plivectx, output_packet, 1);
-                        // log_packet(ps->plivectx, output_packet, 1);
-                        ret = av_interleaved_write_frame(ps->plivectx, output_packet);
-                        if (ret < 0) {
-                            fprintf(stderr, "Error muxing audio packet: %s\n", av_err2str(ret));
-                            goto end;
-                        }
-                        av_packet_unref(output_packet);
-                        av_packet_free(&output_packet);
-                    }
-                    av_frame_free(&output_frame);
-                }
-            } else 
-            {
-                log_packet(pFormatCtx, pkt, 0);
-
-                av_packet_rescale_ts(pkt,
-                                     in_stream->time_base,
-                                     dp->out_astream->time_base);
-                pkt->pos = -1;
-                pkt->stream_index = dp->out_astream->index;
-
-                ps->tx_size += pkt->buf ? pkt->buf->size : 0;
-                // log_packet(ps->plivectx, pkt, 1);
-                int ret = av_interleaved_write_frame(ps->plivectx, pkt);
-                if (ret < 0) {
-                    fprintf(stderr, "Error muxing audio packet: %s\n", av_err2str(ret));
-                    break;
-                }
-                av_packet_unref(pkt);
-                av_packet_free(&pkt);
-            }
-        } else 
-        {
-            av_packet_unref(pkt);
-            av_packet_free(&pkt);
-        }
-    }
-end:
-    return NULL;
-}
 
 void *decode_thread(void *data)
 {
@@ -590,7 +160,7 @@ void *decode_thread(void *data)
         av_freep(&avio_ctx_buffer);
         goto end;
     }
-    dp->pFormatCtx = pFormatCtx;
+    dp->pInputCtx = pFormatCtx;
     
     int ret;
 
@@ -603,7 +173,7 @@ void *decode_thread(void *data)
         AVStream *st = pFormatCtx->streams[ret];
         AVStream *out_stream;
 
-        out_stream = avformat_new_stream(ps->plivectx, NULL);
+        out_stream = avformat_new_stream(dp->pOutputCtx, NULL);
         if (!out_stream) {
             fprintf(stderr, "Failed allocating output stream\n");
             ret = AVERROR_UNKNOWN;
@@ -769,7 +339,7 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 {
                     case 0xc0:  // Audio
                         ps->rx_size += dwBufSize;
-                        if (ps->transcode == -1 && dwBufSize == 96)
+                        if (dp->transcode == -1 && dwBufSize == 96)
                         {
                             // mpeg_pes_head_t *pes_head = (mpeg_pes_head_t *)(pBuffer + 6);
 
@@ -862,7 +432,7 @@ int main(int argc, char **argv)
     AVIOContext *pOutputIO = nullptr;
     HIKEvent_Object *ps = (HIKEvent_Object *)calloc(1, sizeof(HIKEvent_Object));
     global_ps = ps;
-    ps->transcode = 1;
+    int transcode = 1;
 
     av_log_set_level( AV_LOG_DEBUG);
     char c;
@@ -884,7 +454,7 @@ int main(int argc, char **argv)
             streamType = atoi(optarg);
             break;
         case 'N':
-            ps->transcode = 0;
+            transcode = 0;
             break;
         case 'v':
             ps->debug_packet = 3;
@@ -952,8 +522,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    ps->decthread_ctx = init_decode_ctx();
-    ps->decthread_ctx->ps = ps;
+    HIKEvent_DecodeThread *dp = init_decode_ctx();
+    ps->decthread_ctx = dp;
+    dp->ps = ps;
+    dp->transcode = transcode;
+    dp->debug_packet = ps->debug_packet;
     pthread_create(&ps->decthread_ctx->thread, NULL, decode_thread, ps->decthread_ctx);
     pthread_create(&ps->decthread_ctx->process_thread, NULL, process_thread, ps->decthread_ctx);
 
@@ -977,34 +550,35 @@ int main(int argc, char **argv)
     }
 
     /* Create a new format context for the output container format. */
-    if (!(ps->plivectx = avformat_alloc_context())) {
+    if (!(dp->pOutputCtx = avformat_alloc_context())) {
         fprintf(stderr, "Could not allocate output format context\n");
         return AVERROR(ENOMEM);
     }
 
-    /* Associate the output file (pointer) with the container format context. */
-    ps->plivectx->pb = pOutputIO;
-    if (!(ps->plivectx->oformat = av_guess_format("flv", NULL,
+    if (!(dp->pOutputCtx->oformat = av_guess_format("flv", NULL,
                                                               NULL))) {
         fprintf(stderr, "Could not find output file format\n");
         return 1;
     }
 
+    /* Associate the output file (pointer) with the container format context. */
+    dp->pOutputCtx->pb = pOutputIO;
+
     NET_DVR_AUDIO_CHANNEL channelInfo;
     memset(&channelInfo, 0, sizeof(NET_DVR_AUDIO_CHANNEL));
 
     channelInfo.dwChannelNum = ps->struDeviceInfoV40.struDeviceV30.byStartDTalkChan + cameraNo - 1;
-    if (FALSE == NET_DVR_GetCurrentAudioCompress_V50(ps->lUserID, &channelInfo, &ps->compressAudioType))
+    if (FALSE == NET_DVR_GetCurrentAudioCompress_V50(ps->lUserID, &channelInfo, &dp->compressAudioType))
     {
         LONG pErrorNo = NET_DVR_GetLastError();
         fprintf(stderr, "NET_DVR_GetCurrentAudioCompress error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
         return pErrorNo;
     }
 
-    if (ps->compressAudioType.byAudioEncType == 0)
+    if (dp->compressAudioType.byAudioEncType == 0)
     {
         // Require G722 Decoder
-        ps->decthread_ctx->g722_decoder = NET_DVR_InitG722Decoder();
+        dp->g722_decoder = NET_DVR_InitG722Decoder();
     }
 
     // NET_DVR_XML_CONFIG_INPUT inputParam;
@@ -1150,12 +724,12 @@ int main(int argc, char **argv)
 cleanup:
     keepRunning = false;
 
-    if (ps->plivectx && ps->decthread_ctx->outputHeaderWrite)
-        av_write_trailer(ps->plivectx);
+    if (dp->pOutputCtx && ps->decthread_ctx->outputHeaderWrite)
+        av_write_trailer(dp->pOutputCtx);
 
-    if (ps->plivectx && !(ps->plivectx->flags & AVFMT_NOFILE))
-        avio_closep(&ps->plivectx->pb);
-    avformat_free_context(ps->plivectx);
+    if (dp->pOutputCtx && !(dp->pOutputCtx->flags & AVFMT_NOFILE))
+        avio_closep(&dp->pOutputCtx->pb);
+    avformat_free_context(dp->pOutputCtx);
 
     if (ps->decthread_ctx->g722_decoder)
         NET_DVR_ReleaseG722Decoder(ps->decthread_ctx->g722_decoder);

@@ -1,5 +1,8 @@
 #ifndef _HIK_BASE_H
 #define _HIK_BASE_H
+#include "HCNetSDK.h"
+extern "C"
+{
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavformat/avio.h>
@@ -38,6 +41,9 @@ struct hik_queue_s {
 
 typedef struct HIKEvent_DecodeThread {
     void *ps;
+
+    int       channel;
+
     pthread_t thread;
     pthread_t process_thread;
 
@@ -49,6 +55,8 @@ typedef struct HIKEvent_DecodeThread {
     AVStream *out_astream;
 
     int64_t       global_pts;
+    int 		  transcode;
+    int 		  debug_packet;
 
     /* Global timestamp for the audio frames. */
     int64_t video_pts;
@@ -57,7 +65,8 @@ typedef struct HIKEvent_DecodeThread {
     int src_rate;
     int dst_rate;
 
-    AVFormatContext *pFormatCtx;
+    AVFormatContext *pInputCtx;	// Input Context
+    AVFormatContext *pOutputCtx;		// Output Context
     AVCodecContext *dec_ctx;
     AVCodecContext *enc_ctx;
     struct SwsContext *sws_ctx;	// AV_PIX_FMT_YUV420P to RGB
@@ -69,7 +78,7 @@ typedef struct HIKEvent_DecodeThread {
     char stop;
 
     NET_DVR_COMPRESSION_AUDIO compressAudioType;
-    
+
     int      video_src_linesize[4];
     int      video_dst_linesize[4];
 
@@ -145,7 +154,7 @@ double microtime(void);
 void dump_hex(unsigned char *buf, size_t len);
 void log_packet(const AVFormatContext *fmt_ctx, const AVPacket *pkt, int output);
 HIKEvent_DecodeThread *init_decode_ctx();
-void free_decode_ctx(HIKEvent_DecodeThread *p);
+void release_decode_ctx(HIKEvent_DecodeThread *p);
 int init_packet(AVPacket **packet);
 int init_input_frame(AVFrame **frame);
 int decode_audio_frame(AVFrame *frame,
@@ -181,4 +190,7 @@ int encode_audio_frame(HIKEvent_DecodeThread *dp,
                               int *data_present);
 
 AVFormatContext *init_input_ctx(AVIOContext *pb);
+int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st);
+void *process_thread(void *data);
+}
 #endif

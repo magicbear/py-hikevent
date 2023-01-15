@@ -42,6 +42,7 @@ using namespace std;
 #define DVR_REMOTE_CALL_COMMAND 0x4000001
 #define DVR_VIDEO_DATA          0x4000002
 #define DVR_REMOTE_CALL_STATUS  0x4000003
+#define DVR_FLV_DATA            0x4000004
 
 #define sprintfDVRTime(struAlarmTime) "%04d-%02d-%02d %02d:%02d:%02d", struAlarmTime.wYear, struAlarmTime.byMonth, struAlarmTime.byDay, struAlarmTime.byHour, struAlarmTime.byMinute, struAlarmTime.bySecond
 
@@ -865,8 +866,15 @@ void *decode_thread(void *data)
 {
     HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)data;
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)dp->ps;
-    AVIOContext *pb = nullptr;
+    AVIOContext *pb = nullptr, *pOutputIO = NULL;
+    size_t avio_ctx_buffer_size = 1024 * 1024;
+    uint8_t* avio_ctx_buffer = NULL, *avio_output_ctx_buffer = NULL;
     AVFormatContext *pFormatCtx = NULL;
+
+    if (ps->decode_way >= 3)
+    {
+        pthread_create(&dp->process_thread, NULL, process_thread, dp);
+    }
 
     //ffmpeg打开流的回调
     auto onReadData = [](void* pUser, uint8_t* buf, int bufSize)->int
@@ -874,7 +882,7 @@ void *decode_thread(void *data)
         HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)pUser;
         PyHIKEvent_Object *ps = (PyHIKEvent_Object *)dp->ps;
 
-        while (!dp->stop)
+        while (!dp->stop && (ps->decode_way != 3 || ESRCH != pthread_kill(dp->process_thread, 0)))
         {
             pthread_mutex_lock(&dp->lock);
             if (TAILQ_EMPTY(&dp->decode_head))
@@ -905,8 +913,25 @@ void *decode_thread(void *data)
         }
         return 0;
     };
-    size_t avio_ctx_buffer_size = 1024 * 1024;
-    uint8_t* avio_ctx_buffer = NULL;
+
+    //ffmpeg打开流的回调
+    auto onWriteData = [](void* pUser, uint8_t* buf, int bufSize)->int
+    {
+        HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)pUser;
+        PyHIKEvent_Object *ps = (PyHIKEvent_Object *)dp->ps;
+
+        struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+        elem->lCommand = DVR_FLV_DATA;
+        elem->pAlarmInfo = (char *)malloc(bufSize + 2);
+        *(int16_t *)elem->pAlarmInfo = dp->channel;
+        memcpy(elem->pAlarmInfo + 2, buf, bufSize);
+        elem->dwBufLen = bufSize;
+        pthread_mutex_lock(&ps->lock);
+        TAILQ_INSERT_TAIL(&ps->head, elem, entries);
+        pthread_mutex_unlock(&ps->lock);
+
+        return bufSize;
+    };
     
     int video_stream_idx = -1;
     AVCodecContext *dec_ctx;
@@ -937,10 +962,38 @@ void *decode_thread(void *data)
         pFormatCtx = init_input_ctx(pb);
         if (pFormatCtx == NULL)
         {
-            av_freep(&avio_ctx_buffer);
             goto end;
         }
-        dp->pFormatCtx = pFormatCtx;
+        dp->pInputCtx = pFormatCtx;
+
+        if (ps->decode_way >= 3)
+        {
+            avio_output_ctx_buffer = (uint8_t *)av_malloc(avio_ctx_buffer_size);
+            if (!avio_output_ctx_buffer)
+            {
+                fprintf(stderr, "av_malloc ctx buffer failed!");
+                return NULL;                
+            }
+            pOutputIO = avio_alloc_context(avio_output_ctx_buffer, avio_ctx_buffer_size, 1, dp, NULL, onWriteData, NULL);
+            if (pOutputIO == nullptr)  //分配空间失败
+            {
+                fprintf(stderr, "avio_alloc_context failed");
+                goto end;
+            }
+
+            /* Create a new format context for the output container format. */
+            if (!(dp->pOutputCtx = avformat_alloc_context())) {
+                fprintf(stderr, "Could not allocate output format context\n");
+                goto end;
+            }
+
+            if (!(dp->pOutputCtx->oformat = av_guess_format("flv", NULL,
+                                                                      NULL))) {
+                fprintf(stderr, "Could not find output file format\n");
+                goto end;
+            }
+            dp->pOutputCtx->pb = pOutputIO;
+        }
 
         int ret = av_find_best_stream(pFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
         if (ret < 0) {
@@ -952,100 +1005,146 @@ void *decode_thread(void *data)
             AVStream *st = pFormatCtx->streams[ret];
 
             /* find decoder for the stream */
-            AVCodec *dec = NULL;
-            if (st->codecpar->codec_id == AV_CODEC_ID_H264 && ps->decode_way == 2)
+            if (ps->decode_way >= 3)
             {
-                dec = avcodec_find_decoder_by_name("h264_cuvid");
-                if (dec == NULL)
-                    dec = avcodec_find_decoder_by_name("h264_qsv");
-                if (dec == NULL)
-                    dec = avcodec_find_decoder_by_name("h264_v4l2m2m");
-            } else if (st->codecpar->codec_id == AV_CODEC_ID_HEVC && ps->decode_way == 2)
+                AVStream *out_stream;
+
+                out_stream = avformat_new_stream(dp->pOutputCtx, NULL);
+                if (!out_stream) {
+                    fprintf(stderr, "Failed allocating output stream\n");
+                    ret = AVERROR_UNKNOWN;
+                    return NULL;
+                }
+
+                ret = avcodec_parameters_copy(out_stream->codecpar, st->codecpar);
+                if (ret < 0) {
+                    fprintf(stderr, "Failed to copy codec parameters\n");
+                    return NULL;
+                }
+                out_stream->codecpar->codec_tag = 0;
+                dp->out_vstream = out_stream;
+            } else 
             {
-                dec = avcodec_find_decoder_by_name("hevc_cuvid");
-                if (dec == NULL)
-                    dec = avcodec_find_decoder_by_name("hevc_qsv");
-                if (dec == NULL)
-                    dec = avcodec_find_decoder_by_name("hevc_v4l2m2m");
-            }
-            if (dec == NULL) {
-               dec = avcodec_find_decoder(st->codecpar->codec_id);
-            }
-            if (!dec) {
-                fprintf(stderr, "Failed to find %s codec\n",
-                        av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
-                goto end;
-            }
-
-            fprintf(stderr, "Decode video using %s -> %s\n", dec->name, dec->long_name);
-
-            dec_ctx = avcodec_alloc_context3(dec);
-            if (!dec_ctx) {
-                fprintf(stderr, "Failed to allocate the %s codec context\n",
-                        av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
-                goto end;
-            }
-
-            /* Copy codec parameters from input stream to output codec context */
-            if ((ret = avcodec_parameters_to_context(dec_ctx, st->codecpar)) < 0) {
-                fprintf(stderr, "Failed to copy %s codec parameters to decoder context\n",
-                        av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
-                goto end;
-            }
-
-            /* Init the decoders */
-            if ((ret = avcodec_open2(dec_ctx, dec, NULL)) < 0) {
-                fprintf(stderr, "Failed to open %s codec\n",
-                        av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
-                goto end;
-            }
-
-            if (dec_ctx->width == 0 || dec_ctx->height == 0)
-            {
-                fprintf(stderr, "invalid video buffer\n");
-                goto end;
-            }
-
-            /* allocate image where the decoded image will be put */
-            ret = av_image_alloc(video_src_data, dp->video_src_linesize,
-                                 dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt, 1);
-            if (ret < 0) {
-                fprintf(stderr, "Could not allocate raw video buffer\n");
-                goto end;
-            }
-            video_src_bufsize = ret;
-            if (dec_ctx->pix_fmt != AV_PIX_FMT_RGB24)
-            {
-                dp->sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
-                                 dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24,
-                                 SWS_FAST_BILINEAR, NULL, NULL, NULL);
-                if (!dp->sws_ctx) {
-                    fprintf(stderr,
-                            "Impossible to create scale context for the conversion "
-                            "fmt:%s -> fmt:%s\n",
-                            av_get_pix_fmt_name(dec_ctx->pix_fmt), 
-                            av_get_pix_fmt_name(AV_PIX_FMT_RGB24));
+                AVCodec *dec = NULL;
+                if (st->codecpar->codec_id == AV_CODEC_ID_H264 && ps->decode_way == 2)
+                {
+                    dec = avcodec_find_decoder_by_name("h264_cuvid");
+                    if (dec == NULL)
+                        dec = avcodec_find_decoder_by_name("h264_qsv");
+                    if (dec == NULL)
+                        dec = avcodec_find_decoder_by_name("h264_v4l2m2m");
+                } else if (st->codecpar->codec_id == AV_CODEC_ID_HEVC && ps->decode_way == 2)
+                {
+                    dec = avcodec_find_decoder_by_name("hevc_cuvid");
+                    if (dec == NULL)
+                        dec = avcodec_find_decoder_by_name("hevc_qsv");
+                    if (dec == NULL)
+                        dec = avcodec_find_decoder_by_name("hevc_v4l2m2m");
+                }
+                if (dec == NULL) {
+                   dec = avcodec_find_decoder(st->codecpar->codec_id);
+                }
+                if (!dec) {
+                    fprintf(stderr, "Failed to find %s codec\n",
+                            av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
                     goto end;
                 }
 
-                /* buffer is going to be written to rawvideo file, no alignment */
-                if ((ret = av_image_alloc(video_dst_data, dp->video_dst_linesize,
-                                          dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24, 1)) < 0) {
-                    fprintf(stderr, "Could not allocate destination image\n");
+                fprintf(stderr, "Decode video using %s -> %s\n", dec->name, dec->long_name);
+
+                dec_ctx = avcodec_alloc_context3(dec);
+                if (!dec_ctx) {
+                    fprintf(stderr, "Failed to allocate the %s codec context\n",
+                            av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
                     goto end;
                 }
-                video_dst_bufsize = ret;
+
+                /* Copy codec parameters from input stream to output codec context */
+                if ((ret = avcodec_parameters_to_context(dec_ctx, st->codecpar)) < 0) {
+                    fprintf(stderr, "Failed to copy %s codec parameters to decoder context\n",
+                            av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+                    goto end;
+                }
+
+                /* Init the decoders */
+                if ((ret = avcodec_open2(dec_ctx, dec, NULL)) < 0) {
+                    fprintf(stderr, "Failed to open %s codec\n",
+                            av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
+                    goto end;
+                }
+
+                if (dec_ctx->width == 0 || dec_ctx->height == 0)
+                {
+                    fprintf(stderr, "invalid video buffer\n");
+                    goto end;
+                }
+
+                /* allocate image where the decoded image will be put */
+                ret = av_image_alloc(video_src_data, dp->video_src_linesize,
+                                     dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt, 1);
+                if (ret < 0) {
+                    fprintf(stderr, "Could not allocate raw video buffer\n");
+                    goto end;
+                }
+                video_src_bufsize = ret;
+                if (dec_ctx->pix_fmt != AV_PIX_FMT_RGB24)
+                {
+                    dp->sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
+                                     dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24,
+                                     SWS_FAST_BILINEAR, NULL, NULL, NULL);
+                    if (!dp->sws_ctx) {
+                        fprintf(stderr,
+                                "Impossible to create scale context for the conversion "
+                                "fmt:%s -> fmt:%s\n",
+                                av_get_pix_fmt_name(dec_ctx->pix_fmt), 
+                                av_get_pix_fmt_name(AV_PIX_FMT_RGB24));
+                        goto end;
+                    }
+
+                    /* buffer is going to be written to rawvideo file, no alignment */
+                    if ((ret = av_image_alloc(video_dst_data, dp->video_dst_linesize,
+                                              dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24, 1)) < 0) {
+                        fprintf(stderr, "Could not allocate destination image\n");
+                        goto end;
+                    }
+                    video_dst_bufsize = ret;
+                }
+                frame = av_frame_alloc();
+                if (!frame) {
+                    fprintf(stderr, "Could not allocate video frame\n");
+                    goto end;
+                }
             }
         }
+        ret = -1;
+        for (unsigned int i = 0; i < pFormatCtx->nb_streams; i++)
+        {
+            if (pFormatCtx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            {
+                ret = i;
+                break;
+            }
+        }
+        if (ps->decode_way >= 3)
+        {
+            if (ret < 0) {
+                fprintf(stderr, "Could not find %s stream, nb_streams: %d\n",
+                        av_get_media_type_string(AVMEDIA_TYPE_AUDIO), pFormatCtx->nb_streams);
+            } else {
+                AVStream *st = pFormatCtx->streams[ret];
 
-        av_dump_format(pFormatCtx, 0, NULL, 0);
-
-        frame = av_frame_alloc();
-        if (!frame) {
-            fprintf(stderr, "Could not allocate video frame\n");
-            goto end;
+                if (dp->out_astream == NULL)
+                {
+                    if (init_audio_decoder(dp, st))
+                        return NULL;
+                }
+            }
+        } else 
+        {
+            av_dump_format(pFormatCtx, 0, NULL, 0);
         }
     }
+    dp->probedone = true;
 
     while (!dp->stop)
     {
@@ -1065,92 +1164,125 @@ void *decode_thread(void *data)
                 av_packet_free(&pkt);
                 goto end;
             }
-            continue;
-        }
-        if (pkt->stream_index != video_stream_idx)
-        {
+            usleep(1000);   // wait 1ms
             av_packet_unref(pkt);
+            av_packet_free(&pkt);
             continue;
         }
-        // submit the packet to the decoder
-        int ret = avcodec_send_packet(dec_ctx, pkt);
-        if (ret < 0) {
-            fprintf(stderr, "Error submitting a packet for decoding\n");
-            goto end;
-        }
-        // get all the available frames from the decoder
-        while (ret >= 0) {
-            ret = avcodec_receive_frame(dec_ctx, frame);
+        if (ps->decode_way < 3)
+        {
+            if (pkt->stream_index != video_stream_idx)
+            {
+                av_packet_unref(pkt);
+                av_packet_free(&pkt);
+                continue;
+            }
+            // submit the packet to the decoder
+            int ret = avcodec_send_packet(dec_ctx, pkt);
             if (ret < 0) {
-                // those two return values are special and mean there is no output
-                // frame available, but there were no errors during decoding
-                if (ret == AVERROR_EOF)
-                {
-                    fprintf(stderr, "Video Decode EOF\n");
+                fprintf(stderr, "Error submitting a packet for decoding\n");
+                av_packet_free(&pkt);
+                goto end;
+            }
+            // get all the available frames from the decoder
+            while (ret >= 0) {
+                ret = avcodec_receive_frame(dec_ctx, frame);
+                if (ret < 0) {
+                    // those two return values are special and mean there is no output
+                    // frame available, but there were no errors during decoding
+                    if (ret == AVERROR_EOF)
+                    {
+                        fprintf(stderr, "Video Decode EOF\n");
+                        goto end;
+                    }
+                    if (ret == AVERROR(EAGAIN))
+                        break;
+
+                    fprintf(stderr, "Error during decoding\n");
+                    av_packet_free(&pkt);
                     goto end;
                 }
-                if (ret == AVERROR(EAGAIN))
-                    break;
 
-                fprintf(stderr, "Error during decoding\n");
-                goto end;
-            }
+                // write the frame data to output file
+                if (dec_ctx->codec->type == AVMEDIA_TYPE_VIDEO)
+                {
+                    size_t video_bufsize;
+                    uint8_t *video_data;
+                    if (dp->sws_ctx)
+                    {
+                        video_bufsize = video_src_bufsize;
+                        av_image_copy(video_src_data, dp->video_src_linesize,
+                          (const uint8_t **)(frame->data), frame->linesize,
+                          dec_ctx->pix_fmt, dec_ctx->width, dec_ctx->height);
+                        video_data = video_src_data[0];
+                    } else 
+                    {
+                        video_bufsize = video_dst_bufsize;
+                        av_image_copy(video_src_data, dp->video_src_linesize,
+                            (const uint8_t **)(frame->data), frame->linesize,
+                            dec_ctx->pix_fmt, dec_ctx->width, dec_ctx->height);
+                        /* convert to destination format */
+                        sws_scale(dp->sws_ctx, (const uint8_t * const*)video_src_data,
+                                  dp->video_src_linesize, 0, dec_ctx->height, video_dst_data, dp->video_dst_linesize);
+                        video_data = video_dst_data[0];
+                    }
 
-            // write the frame data to output file
-            if (dec_ctx->codec->type == AVMEDIA_TYPE_VIDEO)
-            {
-                size_t video_bufsize;
-                uint8_t *video_data;
-                if (dp->sws_ctx)
-                {
-                    video_bufsize = video_src_bufsize;
-                    av_image_copy(video_src_data, dp->video_src_linesize,
-                      (const uint8_t **)(frame->data), frame->linesize,
-                      dec_ctx->pix_fmt, dec_ctx->width, dec_ctx->height);
-                    video_data = video_src_data[0];
-                } else 
-                {
-                    video_bufsize = video_dst_bufsize;
-                    av_image_copy(video_src_data, dp->video_src_linesize,
-                        (const uint8_t **)(frame->data), frame->linesize,
-                        dec_ctx->pix_fmt, dec_ctx->width, dec_ctx->height);
-                    /* convert to destination format */
-                    sws_scale(dp->sws_ctx, (const uint8_t * const*)video_src_data,
-                              dp->video_src_linesize, 0, dec_ctx->height, video_dst_data, dp->video_dst_linesize);
-                    video_data = video_dst_data[0];
+                    struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+                    elem->lCommand = DVR_VIDEO_DATA;
+                    // elem->pAlarmInfo = yuvData;
+                    elem->pAlarmInfo = (char *)malloc(video_bufsize + 8);
+                    elem->dwBufLen = 8 + video_bufsize;
+                    *((uint32_t *)elem->pAlarmInfo) = dec_ctx->width;
+                    *((uint32_t *)elem->pAlarmInfo+1) = dec_ctx->height;
+                    memcpy(elem->pAlarmInfo + 8, video_data, video_bufsize);
+                    pthread_mutex_lock(&ps->lock);
+                    TAILQ_INSERT_TAIL(&ps->head, elem, entries);
+                    pthread_mutex_unlock(&ps->lock);
                 }
 
-                struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
-                elem->lCommand = DVR_VIDEO_DATA;
-                // elem->pAlarmInfo = yuvData;
-                elem->pAlarmInfo = (char *)malloc(video_bufsize + 8);
-                elem->dwBufLen = 8 + video_bufsize;
-                *((uint32_t *)elem->pAlarmInfo) = dec_ctx->width;
-                *((uint32_t *)elem->pAlarmInfo+1) = dec_ctx->height;
-                memcpy(elem->pAlarmInfo + 8, video_data, video_bufsize);
-                pthread_mutex_lock(&ps->lock);
-                TAILQ_INSERT_TAIL(&ps->head, elem, entries);
-                pthread_mutex_unlock(&ps->lock);
+                av_frame_unref(frame);
+                if (ret < 0)
+                {
+                    fprintf(stderr, "error\n");
+                    av_packet_free(&pkt);
+                    goto end;
+                }
+                av_packet_free(&pkt);
             }
-
-            av_frame_unref(frame);
-            if (ret < 0)
+        }else 
+        {
+            struct hik_queue_s *elem = (struct hik_queue_s *)calloc(1, sizeof(struct hik_queue_s));
+            if (elem)
             {
-                fprintf(stderr, "error\n");
-                goto end;
+                elem->bType = 0;
+                elem->data = (char *)pkt;
+                elem->dwBufLen = 0;
+                pthread_mutex_lock(&dp->lock);
+                TAILQ_INSERT_TAIL(&dp->push_head, elem, entries);
+                pthread_mutex_unlock(&dp->lock);
             }
         }
-        av_packet_free(&pkt);
     }
 end:
     if (avio_ctx_buffer)
         av_freep(&avio_ctx_buffer);
+    if (avio_output_ctx_buffer)
+        av_freep(&avio_output_ctx_buffer);
     if (frame)
         av_frame_free(&frame);
     if (dec_ctx)
         avcodec_free_context(&dec_ctx);
     if (dp->sws_ctx)
         sws_freeContext(dp->sws_ctx);
+
+    if (dp->pOutputCtx && dp->outputHeaderWrite)
+        av_write_trailer(dp->pOutputCtx);
+
+    if (dp->pOutputCtx && !(dp->pOutputCtx->flags & AVFMT_NOFILE))
+        avio_closep(&dp->pOutputCtx->pb);
+
+    if (dp->pOutputCtx)
+        avformat_free_context(dp->pOutputCtx);
 
     av_freep(&video_src_data[0]);
     av_freep(&video_dst_data[0]);
@@ -1174,6 +1306,7 @@ end:
     }
     return NULL;
 }
+
 
 void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *pBuffer,DWORD dwBufSize,void* dwUser) {
     HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)dwUser;
@@ -1227,7 +1360,7 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                     switch (psm->map_stream_id)
                     {
                         case 0xc0:  // Audio
-                            if (ps->decode_way > 2 && dwBufSize == 96)
+                            if (ps->decode_way >= 3 && dp->transcode == -1 && dwBufSize == 96)
                             {
                                 // mpeg_pes_head_t *pes_head = (mpeg_pes_head_t *)(pBuffer + 6);
 
@@ -1326,6 +1459,37 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
         return NULL;
     }
 
+    HIKEvent_DecodeThread *dp = init_decode_ctx();
+    if (dp == NULL)
+    {
+        PyErr_SetString(PyExc_MemoryError, "Init decode context failed");
+        
+        return NULL;
+    }
+    dp->channel = cameraNo;
+
+    NET_DVR_AUDIO_CHANNEL channelInfo;
+    memset(&channelInfo, 0, sizeof(NET_DVR_AUDIO_CHANNEL));
+
+    channelInfo.dwChannelNum = ps->struDeviceInfoV40.struDeviceV30.byStartDTalkChan + cameraNo - 1;
+    if (FALSE == NET_DVR_GetCurrentAudioCompress_V50(ps->lUserID, &channelInfo, &dp->compressAudioType))
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        fprintf(stderr, "NET_DVR_GetCurrentAudioCompress error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        release_decode_ctx(dp);
+        return NULL;
+    }
+
+    if (ps->decode_way == 4)
+        dp->transcode = 0;
+    else
+        dp->transcode = 1;
+    if (dp->compressAudioType.byAudioEncType == 0)
+    {
+        // Require G722 Decoder
+        dp->g722_decoder = NET_DVR_InitG722Decoder();
+    }
+
     NET_DVR_PREVIEWINFO struPlayInfo = {0};
     struPlayInfo.hPlayWnd     = 0;  // 仅取流不解码。这是Linux写法，Windows写法是struPlayInfo.hPlayWnd = NULL;
     struPlayInfo.lChannel     = cameraNo; // 通道号
@@ -1334,13 +1498,6 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
     struPlayInfo.bBlocked     = 1;  // 0- 非阻塞取流，1- 阻塞取流
     //struPlayInfo.dwDisplayBufNum = 1;
 
-    HIKEvent_DecodeThread *dp = init_decode_ctx();
-    if (dp == NULL)
-    {
-        PyErr_SetString(PyExc_MemoryError, "Init decode context failed");
-        
-        return NULL;
-    }
     dp->ps = ps;
 
     long lRealPlayHandle = NET_DVR_RealPlay_V40(ps->lUserID, &struPlayInfo, g_RealDataCallBack_V30, dp); // NET_DVR_RealPlay_V40 实时预览（支持多码流）。
@@ -1862,6 +2019,11 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                 command = "DVR_VIDEO_DATA";
 
                 payload = Py_BuildValue("y#", p->pAlarmInfo, p->dwBufLen);
+                break;
+            case DVR_FLV_DATA:
+                command = "DVR_FLV_DATA";
+
+                payload = Py_BuildValue("{s:i,s:y#}", "channel", *(uint16_t *)p->pAlarmInfo, "data", p->pAlarmInfo+2, p->dwBufLen);
                 break;
             case COMM_ALARM_RULE: // 行为分析信息 -> NET_VCA_RULE_ALARM
             {
