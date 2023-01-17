@@ -24,6 +24,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavformat/avio.h>
 #include <libavutil/file.h>
+#include <libavutil/time.h>
 #include "libswresample/swresample.h"
 #include <libavutil/frame.h>
 #include <libavutil/mem.h>
@@ -812,7 +813,6 @@ void CALLBACK DecCBFun(int nPort, char * pBuf, int nSize, FRAME_INFO * pFrameInf
 
     if (dp->sws_ctx == NULL)
     {
-        printf("Allocate\n");
         dp->sws_ctx = sws_getContext(pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_YUV420P,
                      pFrameInfo->nWidth, pFrameInfo->nHeight, AV_PIX_FMT_RGB24,
                      SWS_FAST_BILINEAR, NULL, NULL, NULL);
@@ -866,10 +866,16 @@ void *decode_thread(void *data)
 {
     HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)data;
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)dp->ps;
-    AVIOContext *pb = nullptr, *pOutputIO = NULL;
+
+    AVClass dec_cls = {
+        .class_name = "HIKEVENT",
+        .item_name = av_default_item_name,
+        .version = LIBAVUTIL_VERSION_INT
+    };
+    AVClass *pdec_cls = &dec_cls;
     size_t avio_ctx_buffer_size = 1024 * 1024;
-    uint8_t* avio_ctx_buffer = NULL, *avio_output_ctx_buffer = NULL;
     AVFormatContext *pFormatCtx = NULL;
+    dp->last_packet_rx = microtime();
 
     if (ps->decode_way >= 3)
     {
@@ -888,9 +894,15 @@ void *decode_thread(void *data)
             if (TAILQ_EMPTY(&dp->decode_head))
             {
                 pthread_mutex_unlock(&dp->lock);
+                if (microtime() - dp->last_packet_rx >= 3)
+                {
+                    // fprintf(stderr, "Decode Thread: Receive Packet Timeout\n");
+                    return AVERROR_EOF;
+                }
                 sleep(0.02);
             } else 
             {
+                dp->last_packet_rx = microtime();
                 struct hik_queue_s *p = TAILQ_FIRST(&dp->decode_head);
                 if ((int)(p->dwBufLen - p->start) < bufSize)
                 {
@@ -934,7 +946,7 @@ void *decode_thread(void *data)
     };
     
     int video_stream_idx = -1;
-    AVCodecContext *dec_ctx;
+    AVCodecContext *dec_ctx = NULL;
     static uint8_t *video_src_data[4] = {NULL};
     static int video_src_bufsize;
 
@@ -946,58 +958,81 @@ void *decode_thread(void *data)
     if (ps->decode_way > 0)
     {
         //ffmpeg-------------------------------
-        avio_ctx_buffer = (uint8_t*)av_malloc(avio_ctx_buffer_size);
+        uint8_t* avio_ctx_buffer = (uint8_t*)av_malloc(avio_ctx_buffer_size);
         if (!avio_ctx_buffer)
         {
-            fprintf(stderr, "av_malloc ctx buffer failed!");
+            av_log(&pdec_cls, AV_LOG_ERROR, "av_malloc ctx buffer failed!");
             return NULL;
         }
-        pb = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size, 0, dp, onReadData, NULL, NULL);
+        AVIOContext *pb = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size, 0, dp, onReadData, NULL, NULL);
         if (pb == nullptr)  //分配空间失败
         {
-            fprintf(stderr, "avio_alloc_context failed");
+            av_freep(&avio_ctx_buffer);
+            av_log(&pdec_cls, AV_LOG_ERROR, "avio_alloc_context failed");
             goto end;
         }
 
-        pFormatCtx = init_input_ctx(pb);
+        pFormatCtx = init_input_ctx(pb, dp->playback ? 1 : 0);
         if (pFormatCtx == NULL)
         {
+            if (pb->buffer != NULL)
+            {
+                av_freep(&pb->buffer);
+                pb->buffer = NULL;
+            }
+            avio_context_free(&pb);
             goto end;
         }
         dp->pInputCtx = pFormatCtx;
 
         if (ps->decode_way >= 3)
         {
-            avio_output_ctx_buffer = (uint8_t *)av_malloc(avio_ctx_buffer_size);
+            uint8_t *avio_output_ctx_buffer = (uint8_t *)av_malloc(avio_ctx_buffer_size);
             if (!avio_output_ctx_buffer)
             {
-                fprintf(stderr, "av_malloc ctx buffer failed!");
+                av_log(&pdec_cls, AV_LOG_ERROR, "av_malloc ctx buffer failed!");
                 return NULL;                
             }
-            pOutputIO = avio_alloc_context(avio_output_ctx_buffer, avio_ctx_buffer_size, 1, dp, NULL, onWriteData, NULL);
+            AVIOContext *pOutputIO = avio_alloc_context(avio_output_ctx_buffer, avio_ctx_buffer_size, 1, dp, NULL, onWriteData, NULL);
             if (pOutputIO == nullptr)  //分配空间失败
             {
-                fprintf(stderr, "avio_alloc_context failed");
+                av_freep(&avio_output_ctx_buffer);
+                av_log(&pdec_cls, AV_LOG_ERROR, "avio_alloc_context failed");
                 goto end;
             }
 
             /* Create a new format context for the output container format. */
             if (!(dp->pOutputCtx = avformat_alloc_context())) {
-                fprintf(stderr, "Could not allocate output format context\n");
+                av_log(&pdec_cls, AV_LOG_ERROR, "Could not allocate output format context\n");
+
+                if (pOutputIO->buffer != NULL)
+                {
+                    av_freep(&pOutputIO->buffer);
+                    pOutputIO->buffer = NULL;
+                }
+                avio_context_free(&pOutputIO);
                 goto end;
             }
 
             if (!(dp->pOutputCtx->oformat = av_guess_format("flv", NULL,
                                                                       NULL))) {
-                fprintf(stderr, "Could not find output file format\n");
+                av_log(&pdec_cls, AV_LOG_ERROR, "Could not find output file format\n");
+
+                if (pOutputIO->buffer != NULL)
+                {
+                    av_freep(&pOutputIO->buffer);
+                    pOutputIO->buffer = NULL;
+                }
+                avio_context_free(&pOutputIO);
                 goto end;
             }
+            dp->pOutputCtx->flags |= AVFMT_NOFILE;
             dp->pOutputCtx->pb = pOutputIO;
         }
 
         int ret = av_find_best_stream(pFormatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
         if (ret < 0) {
-            fprintf(stderr, "Could not find %s stream\n",
+            av_log(&pdec_cls, AV_LOG_ERROR, "Could not find %s stream\n",
                     av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
             goto end;
         } else {
@@ -1011,14 +1046,14 @@ void *decode_thread(void *data)
 
                 out_stream = avformat_new_stream(dp->pOutputCtx, NULL);
                 if (!out_stream) {
-                    fprintf(stderr, "Failed allocating output stream\n");
+                    av_log(&pdec_cls, AV_LOG_ERROR, "Failed allocating output stream\n");
                     ret = AVERROR_UNKNOWN;
                     return NULL;
                 }
 
                 ret = avcodec_parameters_copy(out_stream->codecpar, st->codecpar);
                 if (ret < 0) {
-                    fprintf(stderr, "Failed to copy codec parameters\n");
+                    av_log(&pdec_cls, AV_LOG_ERROR, "Failed to copy codec parameters\n");
                     return NULL;
                 }
                 out_stream->codecpar->codec_tag = 0;
@@ -1045,37 +1080,37 @@ void *decode_thread(void *data)
                    dec = avcodec_find_decoder(st->codecpar->codec_id);
                 }
                 if (!dec) {
-                    fprintf(stderr, "Failed to find %s codec\n",
+                    av_log(&pdec_cls, AV_LOG_ERROR, "Failed to find %s codec\n",
                             av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
                     goto end;
                 }
 
-                fprintf(stderr, "Decode video using %s -> %s\n", dec->name, dec->long_name);
+                av_log(&pdec_cls, AV_LOG_INFO, "Decode video using %s -> %s\n", dec->name, dec->long_name);
 
                 dec_ctx = avcodec_alloc_context3(dec);
                 if (!dec_ctx) {
-                    fprintf(stderr, "Failed to allocate the %s codec context\n",
+                    av_log(&pdec_cls, AV_LOG_ERROR, "Failed to allocate the %s codec context\n",
                             av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
                     goto end;
                 }
 
                 /* Copy codec parameters from input stream to output codec context */
                 if ((ret = avcodec_parameters_to_context(dec_ctx, st->codecpar)) < 0) {
-                    fprintf(stderr, "Failed to copy %s codec parameters to decoder context\n",
+                    av_log(&pdec_cls, AV_LOG_ERROR, "Failed to copy %s codec parameters to decoder context\n",
                             av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
                     goto end;
                 }
 
                 /* Init the decoders */
                 if ((ret = avcodec_open2(dec_ctx, dec, NULL)) < 0) {
-                    fprintf(stderr, "Failed to open %s codec\n",
+                    av_log(&pdec_cls, AV_LOG_ERROR, "Failed to open %s codec\n",
                             av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
                     goto end;
                 }
 
                 if (dec_ctx->width == 0 || dec_ctx->height == 0)
                 {
-                    fprintf(stderr, "invalid video buffer\n");
+                    av_log(&pdec_cls, AV_LOG_ERROR, "invalid video buffer\n");
                     goto end;
                 }
 
@@ -1083,7 +1118,7 @@ void *decode_thread(void *data)
                 ret = av_image_alloc(video_src_data, dp->video_src_linesize,
                                      dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt, 1);
                 if (ret < 0) {
-                    fprintf(stderr, "Could not allocate raw video buffer\n");
+                    av_log(&pdec_cls, AV_LOG_ERROR, "Could not allocate raw video buffer\n");
                     goto end;
                 }
                 video_src_bufsize = ret;
@@ -1093,7 +1128,7 @@ void *decode_thread(void *data)
                                      dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24,
                                      SWS_FAST_BILINEAR, NULL, NULL, NULL);
                     if (!dp->sws_ctx) {
-                        fprintf(stderr,
+                        av_log(&pdec_cls, AV_LOG_ERROR,
                                 "Impossible to create scale context for the conversion "
                                 "fmt:%s -> fmt:%s\n",
                                 av_get_pix_fmt_name(dec_ctx->pix_fmt), 
@@ -1104,14 +1139,14 @@ void *decode_thread(void *data)
                     /* buffer is going to be written to rawvideo file, no alignment */
                     if ((ret = av_image_alloc(video_dst_data, dp->video_dst_linesize,
                                               dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24, 1)) < 0) {
-                        fprintf(stderr, "Could not allocate destination image\n");
+                        av_log(NULL, AV_LOG_ERROR, "Could not allocate destination image\n");
                         goto end;
                     }
                     video_dst_bufsize = ret;
                 }
                 frame = av_frame_alloc();
                 if (!frame) {
-                    fprintf(stderr, "Could not allocate video frame\n");
+                    av_log(NULL, AV_LOG_ERROR, "Could not allocate video frame\n");
                     goto end;
                 }
             }
@@ -1128,7 +1163,7 @@ void *decode_thread(void *data)
         if (ps->decode_way >= 3)
         {
             if (ret < 0) {
-                fprintf(stderr, "Could not find %s stream, nb_streams: %d\n",
+                av_log(&pdec_cls, AV_LOG_ERROR, "Could not find %s stream, nb_streams: %d\n",
                         av_get_media_type_string(AVMEDIA_TYPE_AUDIO), pFormatCtx->nb_streams);
             } else {
                 AVStream *st = pFormatCtx->streams[ret];
@@ -1145,7 +1180,7 @@ void *decode_thread(void *data)
         }
     }
     dp->probedone = true;
-
+    
     while (!dp->stop)
     {
         if (ps->decode_way == 0)
@@ -1153,14 +1188,39 @@ void *decode_thread(void *data)
             usleep(100000);
             continue;
         }
+        if (dp->realtime_playback && dp->global_pts != 0)
+        {
+            if (dp->first_pts == 0)
+            {
+                dp->first_pts = dp->global_pts;
+                dp->start_pts = av_gettime_relative();
+            }
+            double pts = (dp->global_pts - dp->first_pts) * av_q2d(dp->out_vstream->time_base);
+            double now = (av_gettime_relative() - dp->start_pts) / 1000000.;
+            if (pts / 4 - now > 5)
+            {
+                dp->first_pts = 0;
+            }
+            if (pts >= 3 && pts > now * 4 && pts < now + 1)
+            {
+                usleep(floor((pts - now) * 1000000));   // wait 10ms
+                continue;
+            }
+        }
         pkt = av_packet_alloc();
+
         int iRet = av_read_frame(pFormatCtx, pkt);
         //3-检查处理视频 处理重连机制
         if (iRet < 0)
         {
             if (iRet == AVERROR_EOF || !pFormatCtx->pb || avio_feof(pFormatCtx->pb) || pFormatCtx->pb->error)
             {
-                fprintf(stderr, "Error\n");
+                const char *error = "Unknow";
+                if (iRet == AVERROR_EOF) error = "EOF";
+                if (!pFormatCtx->pb) error = "No Input Buffer";
+                if (avio_feof(pFormatCtx->pb)) error = "Input Buffer EOF";
+                if (pFormatCtx->pb->error) error = "Input Buffer Error";
+                av_log(&pdec_cls, AV_LOG_ERROR, "Decode Thread: Error %s\n", error);
                 av_packet_free(&pkt);
                 goto end;
             }
@@ -1180,25 +1240,26 @@ void *decode_thread(void *data)
             // submit the packet to the decoder
             int ret = avcodec_send_packet(dec_ctx, pkt);
             if (ret < 0) {
-                fprintf(stderr, "Error submitting a packet for decoding\n");
+                av_log(&pdec_cls, AV_LOG_ERROR, "Error submitting a packet for decoding\n");
                 av_packet_free(&pkt);
                 goto end;
             }
             // get all the available frames from the decoder
             while (ret >= 0) {
+                frame = av_frame_alloc();
                 ret = avcodec_receive_frame(dec_ctx, frame);
                 if (ret < 0) {
                     // those two return values are special and mean there is no output
                     // frame available, but there were no errors during decoding
                     if (ret == AVERROR_EOF)
                     {
-                        fprintf(stderr, "Video Decode EOF\n");
+                        av_log(&pdec_cls, AV_LOG_WARNING, "Video Decode EOF\n");
                         goto end;
                     }
                     if (ret == AVERROR(EAGAIN))
                         break;
 
-                    fprintf(stderr, "Error during decoding\n");
+                    av_log(&pdec_cls, AV_LOG_ERROR, "Error during decoding\n");
                     av_packet_free(&pkt);
                     goto end;
                 }
@@ -1241,9 +1302,10 @@ void *decode_thread(void *data)
                 }
 
                 av_frame_unref(frame);
+                frame = NULL;
                 if (ret < 0)
                 {
-                    fprintf(stderr, "error\n");
+                    av_log(&pdec_cls, AV_LOG_ERROR, "Error to receive frame from decoder, error: %s\n", av_err2str(ret));
                     av_packet_free(&pkt);
                     goto end;
                 }
@@ -1264,45 +1326,71 @@ void *decode_thread(void *data)
         }
     }
 end:
-    if (avio_ctx_buffer)
-        av_freep(&avio_ctx_buffer);
-    if (avio_output_ctx_buffer)
-        av_freep(&avio_output_ctx_buffer);
-    if (frame)
-        av_frame_free(&frame);
+    if (!dp->stop)
+    {
+        dp->stop = 2;
+    }
+
+    while (ps->decode_way != 3 || ESRCH != pthread_kill(dp->process_thread, 0))
+    {
+        // waiting process thread to terminated
+        usleep(1000);
+    }
+
     if (dec_ctx)
         avcodec_free_context(&dec_ctx);
+
     if (dp->sws_ctx)
         sws_freeContext(dp->sws_ctx);
+
+    if (pFormatCtx)
+    {
+        avformat_close_input(&pFormatCtx);
+    }
 
     if (dp->pOutputCtx && dp->outputHeaderWrite)
         av_write_trailer(dp->pOutputCtx);
 
     if (dp->pOutputCtx && !(dp->pOutputCtx->flags & AVFMT_NOFILE))
+    {
         avio_closep(&dp->pOutputCtx->pb);
+        dp->pOutputCtx->pb = NULL;
+    } else 
+    {
+        if (dp->pOutputCtx->pb->buffer)
+        {
+            dp->pOutputCtx->pb->buffer = NULL;
+            av_freep(&dp->pOutputCtx->pb->buffer);
+        }
+        avio_context_free(&dp->pOutputCtx->pb);
+        dp->pOutputCtx->pb = NULL;
+    }
 
     if (dp->pOutputCtx)
+    {
         avformat_free_context(dp->pOutputCtx);
+        dp->pOutputCtx = NULL;
+    }
 
     av_freep(&video_src_data[0]);
     av_freep(&video_dst_data[0]);
-    if (pb)
-    {
-        if (pb->buffer)
-            av_freep(&pb->buffer);
-        avio_context_free(&pb);
-    }
     if (pFormatCtx)
     {
-        avformat_close_input(&pFormatCtx);
         avformat_free_context(pFormatCtx);
     }
-    if (dp->stop)
+    struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
+    elem->lCommand = DVR_FLV_DATA;
+    elem->pAlarmInfo = (char *)malloc(1);
+    *(int16_t *)elem->pAlarmInfo = dp->channel;
+    elem->dwBufLen = 0;
+    pthread_mutex_lock(&ps->lock);
+    TAILQ_INSERT_TAIL(&ps->head, elem, entries);
+    pthread_mutex_unlock(&ps->lock);
+
+    // fprintf(stderr, "Decode Thread: stopped\n");
+    if (dp->stop == 1)
     {
         free(dp);
-    } else 
-    {
-        dp->stop = 1;
     }
     return NULL;
 }
@@ -1431,12 +1519,25 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                         }
                         case 0xbc:  // PSM Header
                             // https://blog.csdn.net/fanyun_01/article/details/120537670
-                            fprintf(stderr, "rx data  %08x \n", htonl(*(uint32_t *)pBuffer));
+                            fprintf(stderr, "rx psm header  %08x \n", htonl(*(uint32_t *)pBuffer));
                             break;
                         case 0xbd:  // Private Stream Data
                             break;
                         default:
-                            fprintf(stderr, "rx data  %08x \n", htonl(*(uint32_t *)pBuffer));
+                            fprintf(stderr, "rx other data  %08x \n", htonl(*(uint32_t *)pBuffer));
+                    }
+                } else 
+                {
+                    struct hik_queue_s *elem = (struct hik_queue_s *)calloc(1, sizeof(struct hik_queue_s));
+                    if (elem)
+                    {
+                        elem->bType = 0;
+                        elem->data = (char *)malloc(dwBufSize);
+                        memcpy(elem->data, pBuffer, dwBufSize);
+                        elem->dwBufLen = dwBufSize;
+                        pthread_mutex_lock(&dp->lock);
+                        TAILQ_INSERT_TAIL(&dp->decode_head, elem, entries);
+                        pthread_mutex_unlock(&dp->lock);
                     }
                 }
                 break;
@@ -1454,8 +1555,12 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
 
     long cameraNo;
     long streamType = 0;
+    long playback = 0, playback_stop = 0;
+    long lRealPlayHandle;
     ps->decode_way = 0;
-    if (!PyArg_ParseTuple(args, "I|II", &cameraNo, &streamType, &ps->decode_way)) {
+    if (!PyArg_ParseTuple(args, "I|iiii", &cameraNo, &streamType, &ps->decode_way, &playback, &playback_stop)) {
+        PyErr_SetString(PyExc_SyntaxError, "Required Params is <channel>, [stream-type], [decode way], [start], [end]");
+
         return NULL;
     }
 
@@ -1467,6 +1572,7 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
         return NULL;
     }
     dp->channel = cameraNo;
+    dp->ps = ps;
 
     NET_DVR_AUDIO_CHANNEL channelInfo;
     memset(&channelInfo, 0, sizeof(NET_DVR_AUDIO_CHANNEL));
@@ -1490,27 +1596,89 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
         dp->g722_decoder = NET_DVR_InitG722Decoder();
     }
 
-    NET_DVR_PREVIEWINFO struPlayInfo = {0};
-    struPlayInfo.hPlayWnd     = 0;  // 仅取流不解码。这是Linux写法，Windows写法是struPlayInfo.hPlayWnd = NULL;
-    struPlayInfo.lChannel     = cameraNo; // 通道号
-    struPlayInfo.dwStreamType = streamType;  // 0- 主码流，1-子码流，2-码流3，3-码流4，以此类推
-    struPlayInfo.dwLinkMode   = 0;  // 0- TCP方式，1- UDP方式，2- 多播方式，3- RTP方式，4-RTP/RTSP，5-RSTP/HTTP
-    struPlayInfo.bBlocked     = 1;  // 0- 非阻塞取流，1- 阻塞取流
-    //struPlayInfo.dwDisplayBufNum = 1;
+    if (playback)
+    {
+        dp->playback = playback;
+        dp->realtime_playback = 1;
 
-    dp->ps = ps;
+        struct tm *tp = localtime((const time_t *)&dp->playback);
 
-    long lRealPlayHandle = NET_DVR_RealPlay_V40(ps->lUserID, &struPlayInfo, g_RealDataCallBack_V30, dp); // NET_DVR_RealPlay_V40 实时预览（支持多码流）。
-    //lRealPlayHandle = NET_DVR_RealPlay_V30(lUserID, &ClientInfo, NULL, NULL, 0); // NET_DVR_RealPlay_V30 实时预览。
-    if (lRealPlayHandle < 0) {
-        LONG pErrorNo = NET_DVR_GetLastError();
-        sprintf(ps->error_buffer, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
-        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        NET_DVR_VOD_PARA_V50 struPlayback = {0};
+        memset(&struPlayback, 0, sizeof(struPlayback));
+        struPlayback.dwSize = sizeof(struPlayback);
+        struPlayback.struIDInfo.dwSize = sizeof(NET_DVR_STREAM_INFO);
+        struPlayback.struIDInfo.dwChannel = cameraNo;
+
+        struPlayback.struBeginTime.wYear = 1900 + tp->tm_year;
+        struPlayback.struBeginTime.byMonth = 1 + tp->tm_mon;
+        struPlayback.struBeginTime.byDay = tp->tm_mday;
+        struPlayback.struBeginTime.byHour = tp->tm_hour;
+        struPlayback.struBeginTime.byMinute = tp->tm_min;
+        struPlayback.struBeginTime.bySecond = tp->tm_sec - 2;
+
+        time_t endtime = playback_stop > 0 ? playback_stop : dp->playback + 300;
+        tp = localtime((const time_t *)&endtime);
+        struPlayback.struEndTime.wYear = 1900 + tp->tm_year;
+        struPlayback.struEndTime.byMonth = 1 + tp->tm_mon;
+        struPlayback.struEndTime.byDay = tp->tm_mday;
+        struPlayback.struEndTime.byHour = tp->tm_hour;
+        struPlayback.struEndTime.byMinute = tp->tm_min;
+        struPlayback.struEndTime.bySecond = tp->tm_sec;
+
+        //按时间回放
+        lRealPlayHandle = NET_DVR_PlayBackByTime_V50(ps->lUserID, &struPlayback);
+        if (lRealPlayHandle < 0)
+        {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            sprintf(ps->error_buffer, "NET_DVR_PlayBackByTime_V50 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            PyErr_SetString(PyExc_RuntimeError, ps->error_buffer);
+            free(dp);
+            return NULL;
+        }
+
+        if (!NET_DVR_SetPlayDataCallBack_V40(lRealPlayHandle, g_RealDataCallBack_V30, dp))
+        {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            sprintf(ps->error_buffer, "NET_DVR_SetPlayDataCallBack_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            PyErr_SetString(PyExc_RuntimeError, ps->error_buffer);
+            free(dp);
+            return NULL;
+        }
+
+        //---------------------------------------
+        //开始
+        if (!NET_DVR_PlayBackControl_V40(lRealPlayHandle, NET_DVR_PLAYSTART, NULL, 0, NULL, NULL))
+        {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            sprintf(ps->error_buffer, "NET_DVR_PlayBackControl_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            PyErr_SetString(PyExc_RuntimeError, ps->error_buffer);
+            free(dp);
+            return NULL;
+        }
+    } else 
+    {
+        NET_DVR_PREVIEWINFO struPlayInfo = {0};
+        struPlayInfo.hPlayWnd     = 0;  // 仅取流不解码。这是Linux写法，Windows写法是struPlayInfo.hPlayWnd = NULL;
+        struPlayInfo.lChannel     = cameraNo; // 通道号
+        struPlayInfo.dwStreamType = streamType;  // 0- 主码流，1-子码流，2-码流3，3-码流4，以此类推
+        struPlayInfo.dwLinkMode   = 0;  // 0- TCP方式，1- UDP方式，2- 多播方式，3- RTP方式，4-RTP/RTSP，5-RSTP/HTTP
+        struPlayInfo.bBlocked     = 1;  // 0- 非阻塞取流，1- 阻塞取流
+        //struPlayInfo.dwDisplayBufNum = 1;
+
+
+        lRealPlayHandle = NET_DVR_RealPlay_V40(ps->lUserID, &struPlayInfo, g_RealDataCallBack_V30, dp); // NET_DVR_RealPlay_V40 实时预览（支持多码流）。
+        //lRealPlayHandle = NET_DVR_RealPlay_V30(lUserID, &ClientInfo, NULL, NULL, 0); // NET_DVR_RealPlay_V30 实时预览。
+        if (lRealPlayHandle < 0) {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            sprintf(ps->error_buffer, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            PyErr_SetString(PyExc_RuntimeError, ps->error_buffer);
+            
+            free(dp);
+            return NULL;
+        }
         
-        free(dp);
-        return NULL;
     }
-    
+
     dp->nPort = lRealPlayHandle;
     pthread_create(&dp->thread, NULL, decode_thread, dp);
     
@@ -1530,41 +1698,59 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
 static PyObject *stopRealPlay(PyObject *self, PyObject *args) {
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
 
-    long lRealPlayHandle;
-    if (!PyArg_ParseTuple(args, "I", &lRealPlayHandle)) {
+    int lRealPlayHandle;
+    if (!PyArg_ParseTuple(args, "i", &lRealPlayHandle)) {
         return NULL;
     }
 
+    struct hik_queue_s *p = NULL;
+    HIKEvent_DecodeThread *dp = NULL;
+    time_t playback = 0;
+
     if (!TAILQ_EMPTY(&ps->decode_ctx))
     {
-        struct hik_queue_s *p;
-
         pthread_mutex_lock(&ps->lock);
         TAILQ_FOREACH(p, &ps->decode_ctx, entries) {
             if (p->start == lRealPlayHandle)
             {
                 TAILQ_REMOVE(&ps->decode_ctx, p, entries);
-                if (((HIKEvent_DecodeThread *)p->data)->stop)
+                dp = (HIKEvent_DecodeThread *)p->data;
+                playback = dp->playback;
+                if (dp->stop)
                 {
                     free(p->data);
                 } else 
                 {
-                    ((HIKEvent_DecodeThread *)p->data)->stop = 1;
+                    dp->stop = 1;
                 }
                 free(p);
                 break;
             }
-            pthread_mutex_unlock(&ps->lock);
         }
+        pthread_mutex_unlock(&ps->lock);
     }
 
 
-    if (false == NET_DVR_StopRealPlay(lRealPlayHandle)) {    // 停止取流
-        LONG pErrorNo = NET_DVR_GetLastError();
-        sprintf(ps->error_buffer, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
-        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
-        
-        return NULL;
+    if (playback)
+    {
+        //停止回放
+        if (!NET_DVR_StopPlayBack(lRealPlayHandle))
+        {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            sprintf(ps->error_buffer, "NET_DVR_StopPlayBack error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+
+            return NULL;
+        }
+    } else 
+    {
+        if (false == NET_DVR_StopRealPlay(lRealPlayHandle)) {    // 停止取流
+            LONG pErrorNo = NET_DVR_GetLastError();
+            sprintf(ps->error_buffer, "NET_DVR_StopRealPlay error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+            
+            return NULL;
+        }
     }
 
     if (ps->decodeThread)
@@ -1888,17 +2074,23 @@ static PyObject *FindFile(PyObject *self, PyObject *args) {
     memset(&struFileCond, 0, sizeof(NET_DVR_FILECOND_V50));
     time_t     tStart = 0, tEnd = 0;
     struFileCond.dwFileType = 0xFF;
+    // struFileCond.dwFileType = 1;
     struFileCond.struStreamID.dwSize = sizeof(NET_DVR_STREAM_INFO);
     struFileCond.struStreamID.dwChannel = 1;
     struFileCond.byIsLocked = 0xFF;
     // struFileCond.byStreamType = 0xFF;    // not support
     struFileCond.byNeedCard = 0;
 
-    if (!PyArg_ParseTuple(args, "I|III", &struFileCond.struStreamID.dwChannel, &tStart, &tEnd, &struFileCond.byQuickSearch)) {
+    int quickSearch = 0, cameraNo = 0;
+    if (!PyArg_ParseTuple(args, "I|IIi", &cameraNo, &tStart, &tEnd, &quickSearch)) {
         PyErr_SetString(PyExc_SyntaxError, "Required Params is <channel>, [start], [end], [isQuickSearch]");
 
         return NULL;
     }
+
+    struFileCond.struStreamID.dwChannel = cameraNo;
+    struFileCond.byQuickSearch = quickSearch;
+    int foundCount;
 
     if (tStart == 0)
         tStart = time(NULL) - 86400;
@@ -1933,6 +2125,7 @@ static PyObject *FindFile(PyObject *self, PyObject *args) {
         }
         else if (result == NET_DVR_FILE_SUCCESS)
         {
+            foundCount++;
             PyList_Append(list, Py_BuildValue("{s:s,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:l,s:i,s:i}",
                 "FileName", struFileData.sFileName,
                 "FileSize", struFileData.dwFileSize,
@@ -1973,6 +2166,106 @@ static PyObject *FindFile(PyObject *self, PyObject *args) {
     return list;
 }
 
+
+
+static PyObject *FindFileStart(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    NET_DVR_FILECOND_V50 struFileCond;
+    memset(&struFileCond, 0, sizeof(NET_DVR_FILECOND_V50));
+    time_t     tStart = 0, tEnd = 0;
+    struFileCond.dwFileType = 0xFF;
+    // struFileCond.dwFileType = 1;
+    struFileCond.struStreamID.dwSize = sizeof(NET_DVR_STREAM_INFO);
+    struFileCond.struStreamID.dwChannel = 1;
+    struFileCond.byIsLocked = 0xFF;
+    // struFileCond.byStreamType = 0xFF;    // not support
+    struFileCond.byNeedCard = 0;
+
+    int quickSearch = 0, cameraNo = 0;
+    if (!PyArg_ParseTuple(args, "I|IIi", &cameraNo, &tStart, &tEnd, &quickSearch)) {
+        PyErr_SetString(PyExc_SyntaxError, "Required Params is <channel>, [start], [end], [isQuickSearch]");
+
+        return NULL;
+    }
+
+    struFileCond.struStreamID.dwChannel = cameraNo;
+    struFileCond.byQuickSearch = quickSearch;
+
+    if (tStart == 0)
+        tStart = time(NULL) - 86400;
+    if (tEnd == 0)
+        tEnd = time(NULL);
+
+    struFileCond.struStartTime = timestampToSearchTime(tStart);
+    struFileCond.struStopTime = timestampToSearchTime(tEnd);
+
+    //---------------------------------------
+    //查找录像文件
+    int lFindHandle = NET_DVR_FindFile_V50(ps->lUserID, &struFileCond);
+    if (lFindHandle < 0)
+    {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_FindFile_V50 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        PyErr_SetString(PyExc_RuntimeError, ps->error_buffer);
+        
+        return NULL;
+    }
+
+    return Py_BuildValue("i", lFindHandle);
+}
+
+static PyObject *FindFileNext(PyObject *self, PyObject *args) {
+    PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
+
+    NET_DVR_FINDDATA_V50 struFileData;
+    int lFindHandle;
+    if (!PyArg_ParseTuple(args, "i", &lFindHandle)) {
+        PyErr_SetString(PyExc_SyntaxError, "Required Params is <SearchHandler>");
+
+        return NULL;
+    }
+
+    PyObject *list = PyList_New(0);
+    while (true)
+    {
+        int result = NET_DVR_FindNextFile_V50(lFindHandle, &struFileData);
+        if (result == NET_DVR_ISFINDING)
+        {
+            return Py_BuildValue("{s:O,s:i}", "results", list, "remain", 1);
+        }
+        else if (result == NET_DVR_FILE_SUCCESS)
+        {
+            PyList_Append(list, Py_BuildValue("{s:s,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:l,s:i,s:i}",
+                "FileName", struFileData.sFileName,
+                "FileSize", struFileData.dwFileSize,
+                "FileType", struFileData.byFileType,
+                "QuickSearch", struFileData.byQuickSearch,
+                "StreamType", struFileData.byStreamType,
+                "FileIndex", struFileData.dwFileIndex,
+                "Locked", struFileData.byLocked,
+                "BigFileType", struFileData.byBigFileType,
+                "BigFileLen", struFileData.byBigFileType ? ((int64_t)struFileData.dwTotalLenH << 32) | struFileData.dwTotalLenL : 0,
+                "StartTime", SearchTimeTotimestamp(struFileData.struStartTime),
+                "StopTime", SearchTimeTotimestamp(struFileData.struStopTime)
+            ));
+        }
+        else if (result == NET_DVR_FILE_NOFIND || result == NET_DVR_NOMOREFILE)
+        {
+            NET_DVR_FindClose_V30(lFindHandle);
+            return Py_BuildValue("{s:O,s:i}", "results", list, "remain", 0);
+        }
+        else
+        {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            sprintf(ps->error_buffer, "NET_DVR_FindNextFile_V50 NET_DVR_FILE_EXCEPTION, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            PyErr_SetString(PyExc_RuntimeError, ps->error_buffer);
+            NET_DVR_FindClose_V30(lFindHandle);
+            
+            return Py_BuildValue("{s:O,s:i}", "results", list, "error", 1);
+        }
+    }
+}
 
 static PyObject *getevent(PyObject *self, PyObject *args) {
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
@@ -2762,6 +3055,14 @@ static PyMethodDef hiknvsevent_methods[] = {
     },
     {
         "FindFile", FindFile, METH_VARARGS,
+        "Find DVR File"
+    },
+    {
+        "FindFileStart", FindFileStart, METH_VARARGS,
+        "Find DVR File"
+    },
+    {
+        "FindFileNext", FindFileNext, METH_VARARGS,
         "Find DVR File"
     },
     {

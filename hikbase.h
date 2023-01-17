@@ -55,21 +55,28 @@ typedef struct HIKEvent_DecodeThread {
     AVStream *out_astream;
 
     int64_t       global_pts;
-    int 		  transcode;
-    int 		  debug_packet;
+    int           realtime_playback;
+    int64_t       first_pts;
+    int64_t       start_pts;    
+    int           transcode;
+    int           debug_packet;
 
     /* Global timestamp for the audio frames. */
     int64_t video_pts;
     int64_t audio_pts;
 
+    time_t playback;
+
+    double last_packet_rx;
+
     int src_rate;
     int dst_rate;
 
-    AVFormatContext *pInputCtx;	// Input Context
-    AVFormatContext *pOutputCtx;		// Output Context
+    AVFormatContext *pInputCtx; // Input Context
+    AVFormatContext *pOutputCtx;        // Output Context
     AVCodecContext *dec_ctx;
     AVCodecContext *enc_ctx;
-    struct SwsContext *sws_ctx;	// AV_PIX_FMT_YUV420P to RGB
+    struct SwsContext *sws_ctx; // AV_PIX_FMT_YUV420P to RGB
     SwrContext *swr;
     AVAudioFifo *fifo;
     void *g722_decoder;
@@ -82,7 +89,7 @@ typedef struct HIKEvent_DecodeThread {
     int      video_src_linesize[4];
     int      video_dst_linesize[4];
 
-    long 	nPort;
+    long    nPort;
 } HIKEvent_DecodeThread;
 
 #define MICRO_IN_SEC 1000000.00
@@ -189,7 +196,7 @@ int encode_audio_frame(HIKEvent_DecodeThread *dp,
                               AVCodecContext *output_codec_context,
                               int *data_present);
 
-AVFormatContext *init_input_ctx(AVIOContext *pb);
+AVFormatContext *init_input_ctx(AVIOContext *pb, int slow_probe);
 int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st);
 void *process_thread(void *data);
 }

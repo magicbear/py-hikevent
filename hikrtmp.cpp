@@ -28,7 +28,7 @@ char        STREAM_AUDIO_CODEC[256] = {0};
 int         cameraNo;
 int         streamType;
 
-static const char *shortopts = ":h:u:p:c:s:P:Nv?";
+static const char *shortopts = ":h:u:p:c:s:P:v:N?";
 
 static struct option longopts[] = {
   {"host",          1, 0, 'h'},
@@ -37,8 +37,8 @@ static struct option longopts[] = {
   {"camera",        1, 0, 'c'},
   {"stream-type",   1, 0, 's'},
   {"playback",      1, 0, 'P'},
+  {"verbose",       1, 0, 'v'},
   {"ignore-acodec", 0, 0, 'N'},
-  {"verbose",       0, 0, 'v'},
   {"help",          0, 0, '?'},
 
   {0, 0, 0, 0}
@@ -96,8 +96,8 @@ void *decode_thread(void *data)
 {
     HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)data;
     HIKEvent_Object *ps = (HIKEvent_Object *)dp->ps;
-    AVIOContext *pb = nullptr;
     AVFormatContext *pFormatCtx = NULL;
+    dp->last_packet_rx = microtime();
 
     //ffmpeg打开流的回调
     auto onReadData = [](void* pUser, uint8_t* buf, int bufSize)->int
@@ -111,9 +111,15 @@ void *decode_thread(void *data)
             if (TAILQ_EMPTY(&dp->decode_head))
             {
                 pthread_mutex_unlock(&dp->lock);
+                if (microtime() - dp->last_packet_rx >= 3)
+                {
+                    // fprintf(stderr, "Decode Thread: Receive Packet Timeout\n");
+                    return AVERROR_EOF;
+                }
                 usleep(1000);   // wait 1ms
             } else 
             {
+                dp->last_packet_rx = microtime();
                 struct hik_queue_s *p = TAILQ_FIRST(&dp->decode_head);
                 if ((int)(p->dwBufLen - p->start) < bufSize)
                 {
@@ -146,7 +152,7 @@ void *decode_thread(void *data)
         fprintf(stderr, "av_malloc ctx buffer failed!");
         return NULL;
     }
-    pb = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size, 0, dp, onReadData, NULL, NULL);
+    AVIOContext *pb = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size, 0, dp, onReadData, NULL, NULL);
     if (pb == nullptr)  //分配空间失败
     {
         av_freep(&avio_ctx_buffer);
@@ -154,10 +160,11 @@ void *decode_thread(void *data)
         return NULL;
     }
 
-    pFormatCtx = init_input_ctx(pb);
+    pFormatCtx = init_input_ctx(pb, 0);
     if (pFormatCtx == NULL)
     {
-        av_freep(&avio_ctx_buffer);
+        av_freep(&pb->buffer);
+        av_freep(&pb);
         goto end;
     }
     dp->pInputCtx = pFormatCtx;
@@ -223,7 +230,12 @@ void *decode_thread(void *data)
         {
             if (iRet == AVERROR_EOF || !pFormatCtx->pb || avio_feof(pFormatCtx->pb) || pFormatCtx->pb->error)
             {
-                fprintf(stderr, "Error av_read_frame : %s\n", av_err2str(iRet));
+                const char *error = "Unknow";
+                if (iRet == AVERROR_EOF) error = "EOF";
+                if (!pFormatCtx->pb) error = "No Input Buffer";
+                if (avio_feof(pFormatCtx->pb)) error = "Input Buffer EOF";
+                if (pFormatCtx->pb->error) error = "Input Buffer Error";
+                fprintf(stderr, "Decode Thread: Error %s %s\n", error, av_err2str(iRet));
                 av_packet_unref(pkt);
                 av_packet_free(&pkt);
                 goto end;
@@ -248,12 +260,6 @@ void *decode_thread(void *data)
 end:
     // if (pkt)
     //     av_packet_free(&pkt);
-    if (pb)
-    {
-        if (pb->buffer)
-            av_freep(&pb->buffer);
-        avio_context_free(&pb);
-    }
     if (pFormatCtx)
     {
         avformat_close_input(&pFormatCtx);
@@ -457,7 +463,7 @@ int main(int argc, char **argv)
             transcode = 0;
             break;
         case 'v':
-            ps->debug_packet = 3;
+            ps->debug_packet = atoi(optarg);
             break;
         case 'P':
             ps->playback = atoi(optarg);
@@ -473,7 +479,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "  -c --camera <int:cam>     NVR/DVR/Camera Camera Channel\n");
             fprintf(stderr, "  -s --stream-type <int:s>  NVR/DVR/Camera Stream Type (0: Main Stream 1: Sub Stream...)\n");
             fprintf(stderr, "  -N --ignore-acodec        Copy acodec without transcode to AAC\n");
-            fprintf(stderr, "  -v --verbose              Log frames\n");
+            fprintf(stderr, "  -v --verbose <level>      Log frames\n");
             fprintf(stderr, "  -P --playback <int:ts>    Playback timestamp\n");
             fprintf(stderr, "  -? --help                 Show help\n\n");
             // fprintf(stderr,"unknown option \n");
@@ -614,7 +620,8 @@ int main(int argc, char **argv)
     
     if (ps->playback)
     {
-        struct tm *tp = localtime((const time_t *)&ps->playback);
+        dp->playback = ps->playback;
+        struct tm *tp = localtime((const time_t *)&dp->playback);
 
         NET_DVR_VOD_PARA_V50 struPlayback = {0};
         memset(&struPlayback, 0, sizeof(struPlayback));
@@ -629,10 +636,12 @@ int main(int argc, char **argv)
         struPlayback.struBeginTime.byMinute = tp->tm_min;
         struPlayback.struBeginTime.bySecond = tp->tm_sec;
 
+        time_t endtime = dp->playback + 300;
+        tp = localtime((const time_t *)&endtime);
         struPlayback.struEndTime.wYear = 1900 + tp->tm_year;
         struPlayback.struEndTime.byMonth = 1 + tp->tm_mon;
         struPlayback.struEndTime.byDay = tp->tm_mday;
-        struPlayback.struEndTime.byHour = tp->tm_hour + 1;
+        struPlayback.struEndTime.byHour = tp->tm_hour;
         struPlayback.struEndTime.byMinute = tp->tm_min;
         struPlayback.struEndTime.bySecond = tp->tm_sec;
 
@@ -716,7 +725,7 @@ int main(int argc, char **argv)
     {
         if (false == NET_DVR_StopRealPlay(lRealPlayHandle)) {    // 停止取流
             LONG pErrorNo = NET_DVR_GetLastError();
-            fprintf(stderr, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            fprintf(stderr, "NET_DVR_StopRealPlay error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
             NET_DVR_Cleanup();
             return 1;
         }
