@@ -44,6 +44,7 @@ using namespace std;
 #define DVR_VIDEO_DATA          0x4000002
 #define DVR_REMOTE_CALL_STATUS  0x4000003
 #define DVR_FLV_DATA            0x4000004
+#define DVR_MP4_DATA            0x4000005
 
 #define sprintfDVRTime(struAlarmTime) "%04d-%02d-%02d %02d:%02d:%02d", struAlarmTime.wYear, struAlarmTime.byMonth, struAlarmTime.byDay, struAlarmTime.byHour, struAlarmTime.byMinute, struAlarmTime.bySecond
 
@@ -79,7 +80,6 @@ typedef struct {
 
     LONG nPort;
 
-    int decode_way;
     pthread_t *decodeThread;
     // AVCodecContext *codec_ctx;
     // AVCodecParserContext *parser;
@@ -209,9 +209,16 @@ static PyObject *receiveAlarmEvent(PyObject *self, PyObject *args) {
 }
 
 static PyObject *unlock(PyObject *self, PyObject *args) {
+
+    long cmdType = 1;
+
+    if (!PyArg_ParseTuple(args, "|I", &cmdType)) {
+        return NULL;
+    }
+
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
 
-    if (FALSE == NET_DVR_ControlGateway(ps->lUserID, -1, 1))
+    if (FALSE == NET_DVR_ControlGateway(ps->lUserID, -1, cmdType))
     {
         LONG pErrorNo = NET_DVR_GetLastError();
         sprintf(ps->error_buffer, "NET_DVR_ControlGateway error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
@@ -877,7 +884,7 @@ void *decode_thread(void *data)
     AVFormatContext *pFormatCtx = NULL;
     dp->last_packet_rx = microtime();
 
-    if (ps->decode_way >= 3)
+    if (dp->decode_way >= 3)
     {
         pthread_create(&dp->process_thread, NULL, process_thread, dp);
     }
@@ -888,7 +895,7 @@ void *decode_thread(void *data)
         HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)pUser;
         PyHIKEvent_Object *ps = (PyHIKEvent_Object *)dp->ps;
 
-        while (!dp->stop && (ps->decode_way != 3 || ESRCH != pthread_kill(dp->process_thread, 0)))
+        while (!dp->stop && (dp->decode_way != 3 || ESRCH != pthread_kill(dp->process_thread, 0)))
         {
             pthread_mutex_lock(&dp->lock);
             if (TAILQ_EMPTY(&dp->decode_head))
@@ -896,7 +903,7 @@ void *decode_thread(void *data)
                 pthread_mutex_unlock(&dp->lock);
                 if (microtime() - dp->last_packet_rx >= 3)
                 {
-                    // fprintf(stderr, "Decode Thread: Receive Packet Timeout\n");
+                    fprintf(stderr, "Decode Thread: Receive Packet Timeout\n");
                     return AVERROR_EOF;
                 }
                 sleep(0.02);
@@ -955,7 +962,7 @@ void *decode_thread(void *data)
     AVFrame *frame;
     AVPacket *pkt;
 
-    if (ps->decode_way > 0)
+    if (dp->decode_way > 0)
     {
         //ffmpeg-------------------------------
         uint8_t* avio_ctx_buffer = (uint8_t*)av_malloc(avio_ctx_buffer_size);
@@ -985,7 +992,7 @@ void *decode_thread(void *data)
         }
         dp->pInputCtx = pFormatCtx;
 
-        if (ps->decode_way >= 3)
+        if (dp->decode_way >= 3)
         {
             uint8_t *avio_output_ctx_buffer = (uint8_t *)av_malloc(avio_ctx_buffer_size);
             if (!avio_output_ctx_buffer)
@@ -1014,7 +1021,7 @@ void *decode_thread(void *data)
                 goto end;
             }
 
-            if (!(dp->pOutputCtx->oformat = av_guess_format("flv", NULL,
+            if (!(dp->pOutputCtx->oformat = av_guess_format(dp->decode_way == 5 ? "mp4" : "flv", NULL,
                                                                       NULL))) {
                 av_log(&pdec_cls, AV_LOG_ERROR, "Could not find output file format\n");
 
@@ -1040,7 +1047,7 @@ void *decode_thread(void *data)
             AVStream *st = pFormatCtx->streams[ret];
 
             /* find decoder for the stream */
-            if (ps->decode_way >= 3)
+            if (dp->decode_way >= 3)
             {
                 AVStream *out_stream;
 
@@ -1061,14 +1068,14 @@ void *decode_thread(void *data)
             } else 
             {
                 AVCodec *dec = NULL;
-                if (st->codecpar->codec_id == AV_CODEC_ID_H264 && ps->decode_way == 2)
+                if (st->codecpar->codec_id == AV_CODEC_ID_H264 && dp->decode_way == 2)
                 {
                     dec = avcodec_find_decoder_by_name("h264_cuvid");
                     if (dec == NULL)
                         dec = avcodec_find_decoder_by_name("h264_qsv");
                     if (dec == NULL)
                         dec = avcodec_find_decoder_by_name("h264_v4l2m2m");
-                } else if (st->codecpar->codec_id == AV_CODEC_ID_HEVC && ps->decode_way == 2)
+                } else if (st->codecpar->codec_id == AV_CODEC_ID_HEVC && dp->decode_way == 2)
                 {
                     dec = avcodec_find_decoder_by_name("hevc_cuvid");
                     if (dec == NULL)
@@ -1160,7 +1167,7 @@ void *decode_thread(void *data)
                 break;
             }
         }
-        if (ps->decode_way >= 3)
+        if (dp->decode_way >= 3)
         {
             if (ret < 0) {
                 av_log(&pdec_cls, AV_LOG_ERROR, "Could not find %s stream, nb_streams: %d\n",
@@ -1183,7 +1190,7 @@ void *decode_thread(void *data)
     
     while (!dp->stop)
     {
-        if (ps->decode_way == 0)
+        if (dp->decode_way == 0)
         {
             usleep(100000);
             continue;
@@ -1229,7 +1236,7 @@ void *decode_thread(void *data)
             av_packet_free(&pkt);
             continue;
         }
-        if (ps->decode_way < 3)
+        if (dp->decode_way < 3)
         {
             if (pkt->stream_index != video_stream_idx)
             {
@@ -1331,7 +1338,7 @@ end:
         dp->stop = 2;
     }
 
-    while (ps->decode_way != 3 || ESRCH != pthread_kill(dp->process_thread, 0))
+    while (dp->decode_way != 3 || ESRCH != pthread_kill(dp->process_thread, 0))
     {
         // waiting process thread to terminated
         usleep(1000);
@@ -1403,7 +1410,7 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
     switch (dwDataType) {
         case NET_DVR_SYSHEAD: //系统头
         case NET_DVR_AUDIOSTREAMDATA:   // 音频数据
-            if (dwBufSize > 0 && ps->decode_way == 0 && dwDataType == NET_DVR_SYSHEAD)
+            if (dwBufSize > 0 && dp->decode_way == 0 && dwDataType == NET_DVR_SYSHEAD)
             {
                 if (!PlayM4_GetPort(&ps->nPort))
                     break;
@@ -1419,7 +1426,7 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 {
                     fprintf(stderr,"Error: PlayM4_Play %d\n", PlayM4_GetLastError(ps->nPort));
                 }
-            } else if (ps->decode_way > 0 && (dwDataType == NET_DVR_SYSHEAD || ps->decode_way > 2))
+            } else if (dp->decode_way > 0 && (dwDataType == NET_DVR_SYSHEAD || dp->decode_way > 2))
             {
                 struct hik_queue_s *elem = (struct hik_queue_s *)calloc(1, sizeof(struct hik_queue_s));
                 if (elem)
@@ -1435,20 +1442,20 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
             }
             break;
         case NET_DVR_STREAMDATA: //码流数据
-            if (dwBufSize > 0 && ps->nPort != -1 && ps->decode_way == 0) {
+            if (dwBufSize > 0 && ps->nPort != -1 && dp->decode_way == 0) {
                 BOOL inData = PlayM4_InputData(ps->nPort, pBuffer, dwBufSize);
                 while (!inData)
                 {
                     inData = PlayM4_InputData(ps->nPort, pBuffer, dwBufSize);
                 }
-            } else if (dwBufSize > 0 && ps->decode_way > 0) {
+            } else if (dwBufSize > 0 && dp->decode_way > 0) {
                 program_stream_map_t *psm = (program_stream_map_t *)pBuffer;
                 if (psm->packet_start_code_prefix == 0x010000)
                 {
                     switch (psm->map_stream_id)
                     {
                         case 0xc0:  // Audio
-                            if (ps->decode_way >= 3 && dp->transcode == -1 && dwBufSize == 96)
+                            if (dp->decode_way >= 3 && dp->transcode == -1 && dwBufSize == 96)
                             {
                                 // mpeg_pes_head_t *pes_head = (mpeg_pes_head_t *)(pBuffer + 6);
 
@@ -1497,7 +1504,7 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                                 }
 
                                 break;
-                            } else if (ps->decode_way <= 2)
+                            } else if (dp->decode_way <= 2)
                             {
                                 break;  // Ignore Audio
                             }
@@ -1557,8 +1564,8 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
     long streamType = 0;
     long playback = 0, playback_stop = 0;
     long lRealPlayHandle;
-    ps->decode_way = 0;
-    if (!PyArg_ParseTuple(args, "I|iiii", &cameraNo, &streamType, &ps->decode_way, &playback, &playback_stop)) {
+    int  decode_way = 0;
+    if (!PyArg_ParseTuple(args, "I|iiii", &cameraNo, &streamType, &decode_way, &playback, &playback_stop)) {
         PyErr_SetString(PyExc_SyntaxError, "Required Params is <channel>, [stream-type], [decode way], [start], [end]");
 
         return NULL;
@@ -1586,7 +1593,8 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    if (ps->decode_way == 4)
+    dp->decode_way = decode_way;
+    if (dp->decode_way == 4)
         dp->transcode = 0;
     else
         dp->transcode = 1;
@@ -1614,9 +1622,11 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
         struPlayback.struBeginTime.byDay = tp->tm_mday;
         struPlayback.struBeginTime.byHour = tp->tm_hour;
         struPlayback.struBeginTime.byMinute = tp->tm_min;
-        struPlayback.struBeginTime.bySecond = tp->tm_sec - 2;
+        struPlayback.struBeginTime.bySecond = tp->tm_sec;
 
         time_t endtime = playback_stop > 0 ? playback_stop : dp->playback + 300;
+        if (endtime - dp->playback <= 30)
+            endtime = dp->playback + 30;
         tp = localtime((const time_t *)&endtime);
         struPlayback.struEndTime.wYear = 1900 + tp->tm_year;
         struPlayback.struEndTime.byMonth = 1 + tp->tm_mon;
@@ -1624,6 +1634,9 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
         struPlayback.struEndTime.byHour = tp->tm_hour;
         struPlayback.struEndTime.byMinute = tp->tm_min;
         struPlayback.struEndTime.bySecond = tp->tm_sec;
+
+        struPlayback.byOptimalStreamType = 1;
+        struPlayback.byRemoteFile = 1;
 
         //按时间回放
         lRealPlayHandle = NET_DVR_PlayBackByTime_V50(ps->lUserID, &struPlayback);
@@ -2126,7 +2139,7 @@ static PyObject *FindFile(PyObject *self, PyObject *args) {
         else if (result == NET_DVR_FILE_SUCCESS)
         {
             foundCount++;
-            PyList_Append(list, Py_BuildValue("{s:s,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:l,s:i,s:i}",
+            PyList_Append(list, Py_BuildValue("{s:s,s:i,s:i,s:i,s:i,s:I,s:i,s:i,s:l,s:i,s:i}",
                 "FileName", struFileData.sFileName,
                 "FileSize", struFileData.dwFileSize,
                 "FileType", struFileData.byFileType,
@@ -3010,7 +3023,7 @@ static PyMethodDef hiknvsevent_methods[] = {
         "Get Event"
     },
     {   
-        "unlock", unlock, METH_NOARGS,
+        "unlock", unlock, METH_VARARGS,
         "Unlock"
     },
     {

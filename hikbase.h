@@ -61,6 +61,8 @@ typedef struct HIKEvent_DecodeThread {
     int           transcode;
     int           debug_packet;
 
+    int           decode_way;
+
     /* Global timestamp for the audio frames. */
     int64_t video_pts;
     int64_t audio_pts;
@@ -72,8 +74,8 @@ typedef struct HIKEvent_DecodeThread {
     int src_rate;
     int dst_rate;
 
-    AVFormatContext *pInputCtx; // Input Context
-    AVFormatContext *pOutputCtx;        // Output Context
+    AVFormatContext *pInputCtx;     // Input Context
+    AVFormatContext *pOutputCtx;    // Output Context
     AVCodecContext *dec_ctx;
     AVCodecContext *enc_ctx;
     struct SwsContext *sws_ctx; // AV_PIX_FMT_YUV420P to RGB

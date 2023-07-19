@@ -696,7 +696,12 @@ int init_audio_decoder(HIKEvent_DecodeThread *dp, AVStream *st)
     {
         dp->outputHeaderWrite = true;
         fprintf(stderr, "Output: Write header\n");
-        ret = avformat_write_header(dp->pOutputCtx, NULL);
+        AVDictionary* options = NULL;
+        if (dp->decode_way == 5)
+        {
+            av_dict_set(&options, "movflags", "faststart", 0);
+        }
+        ret = avformat_write_header(dp->pOutputCtx, &options);
         if (ret < 0) {
             fprintf(stderr, "Error occurred when opening output file\n");
             goto end;

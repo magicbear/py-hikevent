@@ -681,6 +681,7 @@ int main(int argc, char **argv)
         // NET_DVR_PlayBackByTime_V50
     } else 
     {
+    retry:
         NET_DVR_PREVIEWINFO struPlayInfo = {0};
         struPlayInfo.hPlayWnd     = 0;  // 仅取流不解码。这是Linux写法，Windows写法是struPlayInfo.hPlayWnd = NULL;
         struPlayInfo.lChannel     = cameraNo; // 通道号
@@ -694,6 +695,11 @@ int main(int argc, char **argv)
         if (lRealPlayHandle < 0) {
             LONG pErrorNo = NET_DVR_GetLastError();
             fprintf(stderr, "NET_DVR_RealPlay_V40 error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            if (pErrorNo == 91 && streamType == 1)
+            {
+                streamType = 0;
+                goto retry;
+            }
             NET_DVR_Cleanup();
             return 1;
         }
