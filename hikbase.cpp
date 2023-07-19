@@ -738,6 +738,7 @@ void *process_thread(void *data)
     AVClass dec_cls = {
         .class_name = "HIKEVENT.PROCESS",
         .item_name = av_default_item_name,
+        .option = NULL,
         .version = LIBAVUTIL_VERSION_INT
     };
     AVClass *pdec_cls = &dec_cls;
