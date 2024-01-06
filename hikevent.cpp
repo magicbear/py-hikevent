@@ -2385,18 +2385,27 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                                 "channel", dev->byChannel,
                                 "IvmsChannel", dev->byIvmsChannel,
                             // "Human",
+                                #ifdef MAX_SHIPIMAGE_NUM            // New version SDK
+                                "AgeGroup", human->byGroup,    //年龄段,参见 HUMAN_AGE_GROUP_ENUM
+                                "Age", human->byRes3,//年龄 0-表示“未知”（算法不支持）,0xff-算法支持，但是没有识别出来
+                                "AgeDeviation", human->byDeviation,//年龄误差值
+                                "Ethnic", human->byRes0,
+                                "Beard", human->byRes1, // 胡子, 0-不支持，1-没有胡子，2-有胡子，0xff-unknow表示未知,算法支持未检出
+                                "Race", human->byRes2,
+                                #else
                                 "AgeGroup", human->byAgeGroup,    //年龄段,参见 HUMAN_AGE_GROUP_ENUM
-                                "Sex", human->bySex,         //性别, 0-表示“未知”（算法不支持）,1 – 男 , 2 – 女, 0xff-算法支持，但是没有识别出来
-                                "EyeGlass", human->byEyeGlass,    //是否戴眼镜 0-表示“未知”（算法不支持）,1 – 不戴, 2 – 戴,0xff-算法支持，但是没有识别出来
-                                //抓拍图片人脸年龄的使用方式，如byAge为15,byAgeDeviation为1,表示，实际人脸图片年龄的为14-16之间
                                 "Age", human->byAge,//年龄 0-表示“未知”（算法不支持）,0xff-算法支持，但是没有识别出来
                                 "AgeDeviation", human->byAgeDeviation,//年龄误差值
                                 "Ethnic", human->byEthnic,
+                                "Beard", human->byBeard, // 胡子, 0-不支持，1-没有胡子，2-有胡子，0xff-unknow表示未知,算法支持未检出
+                                "Race", human->byRace,
+                                #endif
+                                "Sex", human->bySex,         //性别, 0-表示“未知”（算法不支持）,1 – 男 , 2 – 女, 0xff-算法支持，但是没有识别出来
+                                "EyeGlass", human->byEyeGlass,    //是否戴眼镜 0-表示“未知”（算法不支持）,1 – 不戴, 2 – 戴,0xff-算法支持，但是没有识别出来
+                                //抓拍图片人脸年龄的使用方式，如byAge为15,byAgeDeviation为1,表示，实际人脸图片年龄的为14-16之间
                                 "Mask", human->byMask,       //是否戴口罩 0-表示“未知”（算法不支持）,1 – 不戴, 2 –戴普通眼镜, 3 –戴墨镜,0xff-算法支持，但是没有识别出来
                                 "Smile", human->bySmile,      //是否微笑 0-表示“未知”（算法不支持）,1 – 不微笑, 2 – 微笑, 0xff-算法支持，但是没有识别出来
                                 "FaceExpression", human->byFaceExpression,    /* 表情,参见FACE_EXPRESSION_GROUP_ENUM*/
-                                "Beard", human->byBeard, // 胡子, 0-不支持，1-没有胡子，2-有胡子，0xff-unknow表示未知,算法支持未检出
-                                "Race", human->byRace,
                                 "Hat", human->byHat // 帽子, 0-不支持,1-不戴帽子,2-戴帽子,0xff-unknow表示未知,算法支持未检出
     
                     );
@@ -2419,7 +2428,11 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
 
                     NET_VCA_FACESNAP_MATCH_ALARM struAlarmInfo;
                     memcpy(&struAlarmInfo, p->pAlarmInfo, sizeof(NET_VCA_FACESNAP_MATCH_ALARM));
+                    #ifdef MAX_SHIPIMAGE_NUM            // New version SDK
+                    NET_VCA_HUMAN_ATTRIBUTE *person = &struAlarmInfo.struBlockListInfo.struBlockListInfo.struAttribute;
+                    #else
                     NET_VCA_HUMAN_ATTRIBUTE *person = &struAlarmInfo.struBlackListInfo.struBlackListInfo.struAttribute;
+                    #endif
                     NET_VCA_DEV_INFO *dev = &struAlarmInfo.struSnapInfo.struDevInfo;
 
                     payload = Py_BuildValue("{s:s,s:i,s:f,s:i,s:i,s:i,s:i,s:i,s:f,s:{s:s,s:i,s:i,s:i},s:{s:i,s:i,s:s,s:i}}", 
@@ -2438,8 +2451,13 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                                 "channel", dev->byChannel,
                                 "IvmsChannel", dev->byIvmsChannel,
                             "PersonInfo", 
-                                "RegisterID", struAlarmInfo.struBlackListInfo.struBlackListInfo.dwRegisterID,
-                                "Type", struAlarmInfo.struBlackListInfo.struBlackListInfo.byType,
+                                #ifdef MAX_SHIPIMAGE_NUM            // New version SDK
+                                    "RegisterID", struAlarmInfo.struBlockListInfo.struBlockListInfo.dwRegisterID,
+                                    "Type", struAlarmInfo.struBlockListInfo.struBlockListInfo.byType,
+                                #else
+                                    "RegisterID", struAlarmInfo.struBlackListInfo.struBlackListInfo.dwRegisterID,
+                                    "Type", struAlarmInfo.struBlackListInfo.struBlackListInfo.byType,
+                                #endif
                                 "Name", person->byName,
                                 "Sex", person->bySex
                         );
@@ -2859,7 +2877,12 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
                                     "ACSInfo",
                                         "CardNo", cardNo,
                                         "CardType", acsEvent->byCardType,
+
+                                        #ifdef MAX_SHIPIMAGE_NUM            // New version SDK
+                                        "WhiteListNo", acsEvent->byAllowListNo,
+                                        #else
                                         "WhiteListNo", acsEvent->byWhiteListNo,
+                                        #endif
                                         "ReportChannel", acsEvent->byReportChannel,
                                         "CardReaderKind", acsEvent->byCardReaderKind,
                                         "CardReaderNo", acsEvent->dwCardReaderNo,
