@@ -989,7 +989,7 @@ void *process_thread(void *data)
 
                 if (ret < 0) {
                     av_log(&pdec_cls, AV_LOG_ERROR, "Error muxing audio packet: %s\n", av_err2str(ret));
-                    break;
+                    goto end;
                 }
             }
         } else 
@@ -999,5 +999,9 @@ void *process_thread(void *data)
         }
     }
 end:
+    av_log(&pdec_cls, AV_LOG_ERROR, "Process thread terminated Thread ID: %d.\n", gettid());
+    dp->process_thread_terminated = true;
+    pthread_exit(NULL);
+    pthread_cancel(pthread_self());
     return NULL;
 }

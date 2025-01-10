@@ -95,7 +95,7 @@ void intHandler(int dummy) {
 void *decode_thread(void *data)
 {
     HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)data;
-    HIKEvent_Object *ps = (HIKEvent_Object *)dp->ps;
+    // HIKEvent_Object *ps = (HIKEvent_Object *)dp->ps;
     AVFormatContext *pFormatCtx = NULL;
     dp->last_packet_rx = microtime();
 
@@ -105,7 +105,7 @@ void *decode_thread(void *data)
         HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)pUser;
         HIKEvent_Object *ps = (HIKEvent_Object *)dp->ps;
 
-        while (keepRunning && ESRCH != pthread_kill(ps->decthread_ctx->process_thread, 0))
+        while (keepRunning && ESRCH != pthread_kill(ps->decthread_ctx->process_thread, 0) && !ps->decthread_ctx->process_thread_terminated)
         {
             pthread_mutex_lock(&dp->lock);
             if (TAILQ_EMPTY(&dp->decode_head))
@@ -113,7 +113,7 @@ void *decode_thread(void *data)
                 pthread_mutex_unlock(&dp->lock);
                 if (microtime() - dp->last_packet_rx >= 3)
                 {
-                    // fprintf(stderr, "Decode Thread: Receive Packet Timeout\n");
+                    fprintf(stderr, "Decode Thread: Receive Packet Timeout\n");
                     return AVERROR_EOF;
                 }
                 usleep(1000);   // wait 1ms
@@ -140,6 +140,7 @@ void *decode_thread(void *data)
             }
 
         }
+        fprintf(stderr, "Decode Thread: Terminated\n");
         return 0;
     };
     size_t avio_ctx_buffer_size = 1024 * 1024;
@@ -441,6 +442,7 @@ int main(int argc, char **argv)
     int transcode = 1;
 
     av_log_set_level( AV_LOG_DEBUG);
+    av_register_all(); // for old version ffmpeg
     char c;
     while ((c = getopt_long(argc, argv, shortopts, longopts, NULL)) != -1) {
         switch (c) {
@@ -561,10 +563,19 @@ int main(int argc, char **argv)
         return AVERROR(ENOMEM);
     }
 
-    if (!(dp->pOutputCtx->oformat = av_guess_format("flv", NULL,
-                                                              NULL))) {
-        fprintf(stderr, "Could not find output file format\n");
-        return 1;
+    if (strncmp(argv[0], "srt://", 6) == 0)
+    {
+        if (!(dp->pOutputCtx->oformat = av_guess_format("mpegts", NULL,
+                                                                  NULL))) {
+            fprintf(stderr, "Could not find output file format\n");
+            return 1;
+        }
+    } else {
+        if (!(dp->pOutputCtx->oformat = av_guess_format("flv", NULL,
+                                                                  NULL))) {
+            fprintf(stderr, "Could not find output file format\n");
+            return 1;
+        }
     }
 
     /* Associate the output file (pointer) with the container format context. */
@@ -705,13 +716,22 @@ int main(int argc, char **argv)
         }
     }
     
+    // pthread_detach(ps->decthread_ctx->thread);
+    // pthread_detach(ps->decthread_ctx->process_thread);
     ps->last_reset = microtime();
     while (keepRunning && ESRCH != pthread_kill(ps->decthread_ctx->thread, 0) && ESRCH != pthread_kill(ps->decthread_ctx->process_thread, 0))
     {
+        if (ps->decthread_ctx->process_thread_terminated)
+        {
+            fprintf(stderr, "process thread terminated.\n");
+            fflush(stderr);
+            break;
+        }
         double now = microtime();
         if (now - ps->last_reset > 1)
         {
-            // printf("rx %-10d bytes  %.2f kbps  tx %.2f kbps      \n", ps->rx_size, ps->rx_size * 8.0 / 1024 / (now - ps->last_reset), ps->tx_size * 8.0 / 1024 / (now - ps->last_reset));
+            // printf("rx %-10d bytes  %.2f kbps  tx %.2f kbps    %d, %d  \n", ps->rx_size, ps->rx_size * 8.0 / 1024 / (now - ps->last_reset), ps->tx_size * 8.0 / 1024 / (now - ps->last_reset),
+            //         pthread_kill(ps->decthread_ctx->thread, 0) , pthread_kill(ps->decthread_ctx->process_thread, 0));
             // fflush(stdout);
             ps->rx_size = 0;
             ps->tx_size = 0;
@@ -749,6 +769,8 @@ cleanup:
     if (ps->decthread_ctx->g722_decoder)
         NET_DVR_ReleaseG722Decoder(ps->decthread_ctx->g722_decoder);
 
+    fprintf(stderr, "streamr terminated\n");
+    fflush(stderr);
     NET_DVR_Logout(ps->lUserID);
     NET_DVR_Cleanup();
     

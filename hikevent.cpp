@@ -2975,7 +2975,8 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
             }
         }
         PyObject *arglist = Py_BuildValue("{s:s,s:i,s:O}", "command", command, "size", p->dwBufLen, "payload", payload);
-        Py_DECREF(payload);
+        if (payload != Py_None)
+            Py_DECREF(payload);
         free(p->pAlarmInfo);
         free(p);
         return arglist;

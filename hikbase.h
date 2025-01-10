@@ -47,6 +47,8 @@ typedef struct HIKEvent_DecodeThread {
     pthread_t thread;
     pthread_t process_thread;
 
+    bool      process_thread_terminated;
+
     pthread_mutex_t lock;
     TAILQ_HEAD(decode_tailhead, hik_queue_s) decode_head;
     TAILQ_HEAD(push_tailhead, hik_queue_s) push_head;

@@ -14,6 +14,8 @@ hello_module = Extension('hikevent', sources = ['hikevent.cpp', 'hikbase.cpp'],
                          runtime_library_dirs=['/usr/local/lib/hcnetsdk']
                          )
 
+print("Do Setup")
+
 setup(name='hikevent',
       version='0.1.0',
       description='Hello world module written in C',
