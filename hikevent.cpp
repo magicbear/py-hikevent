@@ -74,6 +74,7 @@ typedef struct {
     LPVOID hVoiceEnc;
     NET_DVR_AUDIOENC_INFO voiceEncInfo;
     int voiceEncType;           /* byAudioEncType currently initialized, -1 = none */
+    int voiceUseSoftG711;       /* 1 = software G.711 (no SDK InitG711Encoder) */
     unsigned char voiceEncInBuf[8192];
     unsigned char voiceEncOutBuf[8192];
     /* Partial PCM left over when input size is not a multiple of in_frame_size */
@@ -104,6 +105,10 @@ typedef struct {
 
 /* 20ms frame pacing for VoiceCom uplink */
 static const long kVoiceFrameNsec = 20L * 1000L * 1000L;
+/* G.711 mono @ 8kHz: 20ms = 160 samples * 2 bytes PCM → 160 encoded bytes */
+static const int kG711FrameSamples = 160;
+static const int kG711PcmBytes = 160 * 2;
+static const int kG711EncBytes = 160;
 
 static void voice_ts_add_ns(struct timespec *ts, long nsec)
 {
@@ -114,40 +119,92 @@ static void voice_ts_add_ns(struct timespec *ts, long nsec)
     }
 }
 
+/* ITU-T G.711 A-law / μ-law (same tables as SRS / common public domain). */
+static uint8_t voice_linear_to_alaw(int16_t pcm_val)
+{
+    const int ALAW_MAX = 0xFFF;
+    int pcm = (int)pcm_val;
+    int mask;
+    if (pcm >= 0) {
+        mask = 0xD5;
+    } else {
+        mask = 0x55;
+        pcm = -pcm - 8;
+        if (pcm < 0) pcm = 0;
+    }
+    if (pcm > 32767) pcm = 32767;
+    pcm >>= 3;
+    if (pcm > ALAW_MAX) pcm = ALAW_MAX;
+    int exponent = 7;
+    for (int exp_mask = 0x400; (pcm & exp_mask) == 0 && exponent > 0; exponent--, exp_mask >>= 1) {
+    }
+    int mantissa = (pcm >> ((exponent == 0) ? 4 : (exponent + 3))) & 0x0f;
+    return (uint8_t)(((exponent << 4) | mantissa) ^ mask);
+}
+
+static uint8_t voice_linear_to_ulaw(int16_t pcm_val)
+{
+    const int BIAS = 0x84;
+    const int CLIP = 32635;
+    int pcm = (int)pcm_val;
+    int sign = (pcm < 0) ? 0x80 : 0;
+    if (pcm < 0) {
+        pcm = -pcm;
+        if (pcm > 32767) pcm = 32767;
+    }
+    if (pcm > CLIP) pcm = CLIP;
+    pcm += BIAS;
+    int exponent = 7;
+    for (int mask = 0x4000; (pcm & mask) == 0 && exponent > 0; exponent--, mask >>= 1) {
+    }
+    int mantissa = (pcm >> (exponent + 3)) & 0x0f;
+    return (uint8_t)(~(sign | (exponent << 4) | mantissa));
+}
+
+static void voice_encode_g711_soft(const int16_t *pcm, int n, int alaw, uint8_t *out)
+{
+    for (int i = 0; i < n; i++) {
+        out[i] = alaw ? voice_linear_to_alaw(pcm[i]) : voice_linear_to_ulaw(pcm[i]);
+    }
+}
+
 static void release_voice_encoder(PyHIKEvent_Object *ps)
 {
-    if (!ps || !ps->hVoiceEnc || ps->voiceEncType < 0) {
-        if (ps) {
-            ps->hVoiceEnc = NULL;
-            ps->voiceEncType = -1;
-            ps->voicePcmCarryLen = 0;
-            ps->voicePaceActive = 0;
-        }
+    if (!ps) {
         return;
     }
-    if (ps->voiceEncType == 0) {
-        /* SDK: NET_DVR_ReleaseG722Encoder(void *pEncodeHandle) — pass handle, not &handle. */
+    if (ps->hVoiceEnc && ps->voiceEncType == 0) {
         NET_DVR_ReleaseG722Encoder(ps->hVoiceEnc);
-    } else if (ps->voiceEncType == 1 || ps->voiceEncType == 2) {
+    } else if (ps->hVoiceEnc && (ps->voiceEncType == 1 || ps->voiceEncType == 2) && !ps->voiceUseSoftG711) {
         NET_DVR_ReleaseG711Encoder(ps->hVoiceEnc);
     }
     ps->hVoiceEnc = NULL;
     ps->voiceEncType = -1;
+    ps->voiceUseSoftG711 = 0;
     ps->voicePcmCarryLen = 0;
     ps->voicePaceActive = 0;
     memset(&ps->voiceEncInfo, 0, sizeof(ps->voiceEncInfo));
 }
 
+/**
+ * Prepare encoder for talk uplink.
+ * G.711 A/μ: use software encode (NET_DVR_InitG711Encoder often returns NULL with
+ * err=0 on some SDK builds — that broke warm-up / sendVoice). G722 still uses SDK.
+ */
 static int ensure_voice_encoder(PyHIKEvent_Object *ps, int enc_type, const char **out_name)
 {
-    if (ps->hVoiceEnc && ps->voiceEncType == enc_type) {
-        if (out_name) {
-            if (enc_type == 0) *out_name = "G722";
-            else if (enc_type == 1) *out_name = "G711_U";
-            else if (enc_type == 2) *out_name = "G711_A";
-            else *out_name = "G726";
+    if (ps->voiceEncType == enc_type &&
+        (ps->voiceUseSoftG711 || ps->hVoiceEnc != NULL || enc_type == 1 || enc_type == 2)) {
+        /* Already ready (software G711 may have hVoiceEnc == NULL). */
+        if (enc_type == 1 || enc_type == 2 || ps->hVoiceEnc != NULL) {
+            if (out_name) {
+                if (enc_type == 0) *out_name = "G722";
+                else if (enc_type == 1) *out_name = "G711_U";
+                else if (enc_type == 2) *out_name = "G711_A";
+                else *out_name = "G726";
+            }
+            return 0;
         }
-        return 0;
     }
     release_voice_encoder(ps);
 
@@ -159,15 +216,28 @@ static int ensure_voice_encoder(PyHIKEvent_Object *ps, int enc_type, const char 
     if (enc_type == 0) {
         encoderName = "G722";
         h = NET_DVR_InitG722Encoder(&info_param);
-    } else if (enc_type == 1) {
-        encoderName = "G711_U";
-        h = NET_DVR_InitG711Encoder(&info_param);
-        /* Preserve original quirk: half in_frame_size for µ-law. */
-        if (info_param.in_frame_size > 0)
-            info_param.in_frame_size /= 2;
-    } else if (enc_type == 2) {
-        encoderName = "G711_A";
-        h = NET_DVR_InitG711Encoder(&info_param);
+        /* Original code only treated -1 as failure (NULL/0 may be returned oddly). */
+        if ((long)h == -1) {
+            LONG pErrorNo = NET_DVR_GetLastError();
+            sprintf(ps->error_buffer, "NET_DVR_InitG722Encoder error, %d: %s\n",
+                    pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            return -1;
+        }
+        if (info_param.in_frame_size <= 0 || info_param.in_frame_size > (DWORD)sizeof(ps->voiceEncInBuf)) {
+            info_param.in_frame_size = 1280; /* common G722 20ms */
+        }
+        ps->hVoiceEnc = h;
+        ps->voiceEncInfo = info_param;
+        ps->voiceEncType = enc_type;
+        ps->voiceUseSoftG711 = 0;
+    } else if (enc_type == 1 || enc_type == 2) {
+        /* Software G.711 — no InitG711Encoder (fixes err=0 / NULL handle on many SDK builds). */
+        encoderName = (enc_type == 2) ? "G711_A(soft)" : "G711_U(soft)";
+        ps->hVoiceEnc = NULL;
+        ps->voiceUseSoftG711 = 1;
+        ps->voiceEncType = enc_type;
+        memset(&ps->voiceEncInfo, 0, sizeof(ps->voiceEncInfo));
+        ps->voiceEncInfo.in_frame_size = kG711PcmBytes;
     } else if (enc_type == 4) {
         encoderName = "G726";
         if (out_name) *out_name = encoderName;
@@ -178,20 +248,6 @@ static int ensure_voice_encoder(PyHIKEvent_Object *ps, int enc_type, const char 
         return -1;
     }
 
-    if (h == NULL || (long)h == -1) {
-        LONG pErrorNo = NET_DVR_GetLastError();
-        sprintf(ps->error_buffer, "NET_DVR_Init%sEncoder error, %d: %s\n",
-                encoderName, pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
-        return -1;
-    }
-    if (info_param.in_frame_size <= 0 || info_param.in_frame_size > (DWORD)sizeof(ps->voiceEncInBuf)) {
-        /* Fallback: G.711 20ms @ 8k mono S16 = 320 bytes */
-        info_param.in_frame_size = 320;
-    }
-
-    ps->hVoiceEnc = h;
-    ps->voiceEncInfo = info_param;
-    ps->voiceEncType = enc_type;
     ps->voicePcmCarryLen = 0;
     ps->voicePaceActive = 0;
     if (out_name) *out_name = encoderName;
@@ -263,6 +319,7 @@ hikevent_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     ps->lVoiceHandler = -1;
     ps->hVoiceEnc = NULL;
     ps->voiceEncType = -1;
+    ps->voiceUseSoftG711 = 0;
     ps->voicePcmCarryLen = 0;
     ps->voicePaceActive = 0;
     memset(&ps->voiceEncInfo, 0, sizeof(ps->voiceEncInfo));
@@ -704,7 +761,7 @@ static PyObject *startVoiceTalk(PyObject *self, PyObject *args) {
     /* New talk session: drop any cached encoder / pace state from previous channel. */
     release_voice_encoder(ps);
 
-    if (ps->lVoiceHandler != -1 && ps->lVoiceHandler != 0)
+    if (ps->lVoiceHandler != -1)
     {
         if (FALSE == NET_DVR_StopVoiceCom(ps->lVoiceHandler))
         {
@@ -764,9 +821,9 @@ static PyObject *stopVoiceTalk(PyObject *self, PyObject *args) {
 
     release_voice_encoder(ps);
 
-    if (ps->lVoiceHandler == -1 || ps->lVoiceHandler == 0)
+    /* Only -1 means "not started". Handle 0 can be valid on some SDK builds. */
+    if (ps->lVoiceHandler == -1)
     {
-        ps->lVoiceHandler = -1;
         Py_RETURN_NONE;
     }
     if (FALSE == NET_DVR_StopVoiceCom(ps->lVoiceHandler))
@@ -819,8 +876,9 @@ static PyObject *sendVoice(PyObject *self, PyObject *args) {
         return NULL;
     }
 
+    /* StartVoiceCom can return handle 0 on some devices; only -1 is invalid. */
     LONG voiceHandler = (specifiedVoiceHandler != -1) ? specifiedVoiceHandler : ps->lVoiceHandler;
-    if (voiceHandler == -1 || voiceHandler == 0) {
+    if (voiceHandler == -1) {
         sprintf(ps->error_buffer, "Voice Talk is not started (handler invalid)");
         PyErr_SetString(PyExc_TypeError, ps->error_buffer);
         return NULL;
@@ -864,6 +922,7 @@ static PyObject *sendVoice(PyObject *self, PyObject *args) {
 
     int offset = 0;
     int blockcount = 0;
+    DWORD out_frame_size = 0;
 
     while (offset + frame_size <= src_len) {
         memcpy(ps->voiceEncInBuf, src + offset, (size_t)frame_size);
@@ -871,11 +930,26 @@ static PyObject *sendVoice(PyObject *self, PyObject *args) {
         blockcount++;
 
         BOOL ret = FALSE;
+        out_frame_size = 0;
         if (enc_type == 0) {
             ret = NET_DVR_EncodeG722Frame(ps->hVoiceEnc, &enc_proc_param);
+            out_frame_size = enc_proc_param.out_frame_size;
         } else if (enc_type == 1 || enc_type == 2) {
-            ret = NET_DVR_EncodeG711Frame(ps->hVoiceEnc, &enc_proc_param);
-            enc_proc_param.out_frame_size = 160;
+            if (ps->voiceUseSoftG711) {
+                /* PCM S16LE → G.711, 160 samples → 160 bytes */
+                voice_encode_g711_soft((const int16_t *)ps->voiceEncInBuf, kG711FrameSamples,
+                                       enc_type == 2 /* A-law */, ps->voiceEncOutBuf);
+                out_frame_size = kG711EncBytes;
+                ret = TRUE;
+            } else if (ps->hVoiceEnc) {
+                ret = NET_DVR_EncodeG711Frame(ps->hVoiceEnc, &enc_proc_param);
+                out_frame_size = 160;
+            } else {
+                /* Stateless SDK overload: EncodeG711Frame(iType, in, out). */
+                DWORD iType = (enc_type == 2) ? 1 : 0; /* 0=μ, 1=A */
+                ret = NET_DVR_EncodeG711Frame(iType, ps->voiceEncInBuf, ps->voiceEncOutBuf);
+                out_frame_size = 160;
+            }
         } else {
             ret = FALSE;
         }
@@ -890,7 +964,7 @@ static PyObject *sendVoice(PyObject *self, PyObject *args) {
             return NULL;
         }
 
-        if (!NET_DVR_VoiceComSendData(voiceHandler, (char *)ps->voiceEncOutBuf, enc_proc_param.out_frame_size)) {
+        if (!NET_DVR_VoiceComSendData(voiceHandler, (char *)ps->voiceEncOutBuf, out_frame_size)) {
             LONG pErrorNo = NET_DVR_GetLastError();
             sprintf(ps->error_buffer, "NET_DVR_VoiceComSendData error, %d: %s\n",
                     pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
@@ -3262,7 +3336,7 @@ static void release(PyObject *self) {
     }
 
     /* Stop talk + release cached encoder before logout. */
-    if (ps->lVoiceHandler != -1 && ps->lVoiceHandler != 0) {
+    if (ps->lVoiceHandler != -1) {
         NET_DVR_StopVoiceCom(ps->lVoiceHandler);
         ps->lVoiceHandler = -1;
     }
