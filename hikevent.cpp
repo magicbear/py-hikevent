@@ -935,21 +935,12 @@ static PyObject *sendVoice(PyObject *self, PyObject *args) {
             ret = NET_DVR_EncodeG722Frame(ps->hVoiceEnc, &enc_proc_param);
             out_frame_size = enc_proc_param.out_frame_size;
         } else if (enc_type == 1 || enc_type == 2) {
-            if (ps->voiceUseSoftG711) {
-                /* PCM S16LE → G.711, 160 samples → 160 bytes */
-                voice_encode_g711_soft((const int16_t *)ps->voiceEncInBuf, kG711FrameSamples,
-                                       enc_type == 2 /* A-law */, ps->voiceEncOutBuf);
-                out_frame_size = kG711EncBytes;
-                ret = TRUE;
-            } else if (ps->hVoiceEnc) {
-                ret = NET_DVR_EncodeG711Frame(ps->hVoiceEnc, &enc_proc_param);
-                out_frame_size = 160;
-            } else {
-                /* Stateless SDK overload: EncodeG711Frame(iType, in, out). */
-                DWORD iType = (enc_type == 2) ? 1 : 0; /* 0=μ, 1=A */
-                ret = NET_DVR_EncodeG711Frame(iType, ps->voiceEncInBuf, ps->voiceEncOutBuf);
-                out_frame_size = 160;
-            }
+            /* Always software G.711 (InitG711Encoder unreliable; no 3-arg Encode overload in SDK). */
+            voice_encode_g711_soft((const int16_t *)ps->voiceEncInBuf, kG711FrameSamples,
+                                   enc_type == 2 /* A-law */, ps->voiceEncOutBuf);
+            out_frame_size = kG711EncBytes;
+            ret = TRUE;
+            (void)enc_proc_param;
         } else {
             ret = FALSE;
         }
