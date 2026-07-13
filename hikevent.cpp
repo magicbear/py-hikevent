@@ -70,6 +70,19 @@ typedef struct {
     bool alarmChannelOpened;
     bool callChannelOpened;
 
+    /* Cached voice encoder (avoid Init/Release on every sendVoice — major lag source). */
+    LPVOID hVoiceEnc;
+    NET_DVR_AUDIOENC_INFO voiceEncInfo;
+    int voiceEncType;           /* byAudioEncType currently initialized, -1 = none */
+    unsigned char voiceEncInBuf[8192];
+    unsigned char voiceEncOutBuf[8192];
+    /* Partial PCM left over when input size is not a multiple of in_frame_size */
+    unsigned char voicePcmCarry[4096];
+    int voicePcmCarryLen;
+    /* Absolute wall-clock pacing between 20ms frames (sleep(0.02) was a no-op!). */
+    int voicePaceActive;
+    struct timespec voiceNextDeadline;
+
     TAILQ_HEAD(tailhead, entry) head;
     TAILQ_HEAD(decode_ctx_tailhead, hik_queue_s) decode_ctx;
 
@@ -88,6 +101,102 @@ typedef struct {
 
     /* Type-specific fields go here. */
 } PyHIKEvent_Object;
+
+/* 20ms frame pacing for VoiceCom uplink */
+static const long kVoiceFrameNsec = 20L * 1000L * 1000L;
+
+static void voice_ts_add_ns(struct timespec *ts, long nsec)
+{
+    ts->tv_nsec += nsec;
+    while (ts->tv_nsec >= 1000000000L) {
+        ts->tv_nsec -= 1000000000L;
+        ts->tv_sec += 1;
+    }
+}
+
+static void release_voice_encoder(PyHIKEvent_Object *ps)
+{
+    if (!ps || !ps->hVoiceEnc || ps->voiceEncType < 0) {
+        if (ps) {
+            ps->hVoiceEnc = NULL;
+            ps->voiceEncType = -1;
+            ps->voicePcmCarryLen = 0;
+            ps->voicePaceActive = 0;
+        }
+        return;
+    }
+    if (ps->voiceEncType == 0) {
+        /* SDK: NET_DVR_ReleaseG722Encoder(void *pEncodeHandle) — pass handle, not &handle. */
+        NET_DVR_ReleaseG722Encoder(ps->hVoiceEnc);
+    } else if (ps->voiceEncType == 1 || ps->voiceEncType == 2) {
+        NET_DVR_ReleaseG711Encoder(ps->hVoiceEnc);
+    }
+    ps->hVoiceEnc = NULL;
+    ps->voiceEncType = -1;
+    ps->voicePcmCarryLen = 0;
+    ps->voicePaceActive = 0;
+    memset(&ps->voiceEncInfo, 0, sizeof(ps->voiceEncInfo));
+}
+
+static int ensure_voice_encoder(PyHIKEvent_Object *ps, int enc_type, const char **out_name)
+{
+    if (ps->hVoiceEnc && ps->voiceEncType == enc_type) {
+        if (out_name) {
+            if (enc_type == 0) *out_name = "G722";
+            else if (enc_type == 1) *out_name = "G711_U";
+            else if (enc_type == 2) *out_name = "G711_A";
+            else *out_name = "G726";
+        }
+        return 0;
+    }
+    release_voice_encoder(ps);
+
+    NET_DVR_AUDIOENC_INFO info_param;
+    memset(&info_param, 0, sizeof(info_param));
+    LPVOID h = NULL;
+    const char *encoderName = "unknown";
+
+    if (enc_type == 0) {
+        encoderName = "G722";
+        h = NET_DVR_InitG722Encoder(&info_param);
+    } else if (enc_type == 1) {
+        encoderName = "G711_U";
+        h = NET_DVR_InitG711Encoder(&info_param);
+        /* Preserve original quirk: half in_frame_size for µ-law. */
+        if (info_param.in_frame_size > 0)
+            info_param.in_frame_size /= 2;
+    } else if (enc_type == 2) {
+        encoderName = "G711_A";
+        h = NET_DVR_InitG711Encoder(&info_param);
+    } else if (enc_type == 4) {
+        encoderName = "G726";
+        if (out_name) *out_name = encoderName;
+        sprintf(ps->error_buffer, "G726 encoder not implemented");
+        return -1;
+    } else {
+        sprintf(ps->error_buffer, "unsupported voice enc type %d", enc_type);
+        return -1;
+    }
+
+    if (h == NULL || (long)h == -1) {
+        LONG pErrorNo = NET_DVR_GetLastError();
+        sprintf(ps->error_buffer, "NET_DVR_Init%sEncoder error, %d: %s\n",
+                encoderName, pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+        return -1;
+    }
+    if (info_param.in_frame_size <= 0 || info_param.in_frame_size > (DWORD)sizeof(ps->voiceEncInBuf)) {
+        /* Fallback: G.711 20ms @ 8k mono S16 = 320 bytes */
+        info_param.in_frame_size = 320;
+    }
+
+    ps->hVoiceEnc = h;
+    ps->voiceEncInfo = info_param;
+    ps->voiceEncType = enc_type;
+    ps->voicePcmCarryLen = 0;
+    ps->voicePaceActive = 0;
+    if (out_name) *out_name = encoderName;
+    return 0;
+}
 
 
 void CALLBACK MessageCallback(LONG lCommand, NET_DVR_ALARMER *pAlarmer, char *pAlarmInfo, DWORD dwBufLen, void* pUser)
@@ -152,6 +261,11 @@ hikevent_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
     memcpy(ps->struLoginInfo.sPassword, ps->passwd, strlen(ps->passwd) > NAME_LEN ? NAME_LEN : strlen(ps->passwd));
 
     ps->lVoiceHandler = -1;
+    ps->hVoiceEnc = NULL;
+    ps->voiceEncType = -1;
+    ps->voicePcmCarryLen = 0;
+    ps->voicePaceActive = 0;
+    memset(&ps->voiceEncInfo, 0, sizeof(ps->voiceEncInfo));
     ps->lUserID = NET_DVR_Login_V40(&ps->struLoginInfo, &ps->struDeviceInfoV40);
 
     if (ps->lUserID < 0)
@@ -587,6 +701,9 @@ static PyObject *startVoiceTalk(PyObject *self, PyObject *args) {
     } else {
         cameraNo = ps->struDeviceInfoV40.struDeviceV30.byStartDChan;
     }
+    /* New talk session: drop any cached encoder / pace state from previous channel. */
+    release_voice_encoder(ps);
+
     if (ps->lVoiceHandler != -1 && ps->lVoiceHandler != 0)
     {
         if (FALSE == NET_DVR_StopVoiceCom(ps->lVoiceHandler))
@@ -596,6 +713,7 @@ static PyObject *startVoiceTalk(PyObject *self, PyObject *args) {
             PyErr_SetString(PyExc_TypeError, ps->error_buffer);
             return NULL;
         }
+        ps->lVoiceHandler = -1;
     }
     ps->lVoiceHandler = NET_DVR_StartVoiceCom_MR_V30(ps->lUserID, cameraNo, fVoiceDataCallBack, NULL);
     if (ps->lVoiceHandler == -1)
@@ -629,6 +747,14 @@ static PyObject *startVoiceTalk(PyObject *self, PyObject *args) {
         //     PyErr_SetString(PyExc_TypeError, ps->error_buffer);
         //     return NULL;
     }
+    /* Warm up encoder once at talk start (first sendVoice was paying this cost). */
+    {
+        const char *encName = NULL;
+        if (ensure_voice_encoder(ps, (int)ps->compressAudioType.byAudioEncType, &encName) != 0) {
+            fprintf(stderr, "startVoiceTalk: encoder warm-up failed: %s\n", ps->error_buffer);
+            /* Non-fatal: sendVoice will retry. */
+        }
+    }
     return Py_BuildValue("{s:i,s:i,s:i}", "AudioEncode", ps->compressAudioType.byAudioEncType, 
                         "SampleRate", sampleRate, "handler", ps->lVoiceHandler);
 }
@@ -636,133 +762,186 @@ static PyObject *startVoiceTalk(PyObject *self, PyObject *args) {
 static PyObject *stopVoiceTalk(PyObject *self, PyObject *args) {
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
 
-    if (ps->lVoiceHandler == -1)
+    release_voice_encoder(ps);
+
+    if (ps->lVoiceHandler == -1 || ps->lVoiceHandler == 0)
     {
-        sprintf(ps->error_buffer, "Voice Talk is not started");
-        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
-        return NULL;
+        ps->lVoiceHandler = -1;
+        Py_RETURN_NONE;
     }
     if (FALSE == NET_DVR_StopVoiceCom(ps->lVoiceHandler))
     {
         LONG pErrorNo = NET_DVR_GetLastError();
         sprintf(ps->error_buffer, "NET_DVR_StopVoiceCom error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
         PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        ps->lVoiceHandler = -1;
         return NULL;
     }
-    ps->lVoiceHandler = 0;
+    ps->lVoiceHandler = -1;
 
     Py_RETURN_NONE;
 }
 
+/**
+ * Encode PCM S16LE and send via VoiceCom.
+ *
+ * Fixes that caused camera talk lag/stutter:
+ *  1) sleep(0.02) is a no-op in C (sleep takes whole seconds) → multi-frame PCM was
+ *     blasted into the NVR buffer → growing delay. Now use absolute CLOCK_MONOTONIC
+ *     deadlines of 20ms per encoded frame.
+ *  2) Init/Release encoder on every call was expensive and glitchy. Encoder is cached
+ *     on the object until stopVoiceTalk / re-start.
+ *  3) Carry incomplete frames across calls (input size need not be in_frame_size multiple).
+ */
 static PyObject *sendVoice(PyObject *self, PyObject *args) {
     PyHIKEvent_Object *ps = (PyHIKEvent_Object *)self;
 
     char *inputBuffer;
     Py_ssize_t bufferLength;
     LONG specifiedVoiceHandler = -1;
-    if (!PyArg_ParseTuple(args, "y#|iii", &inputBuffer, &bufferLength, &ps->compressAudioType.byAudioEncType, &specifiedVoiceHandler)) {
+    int enc_type_arg = -1;
+    /* y#|ii : optional override enc type + voice handler (legacy signature y#|iii kept via two ints) */
+    if (!PyArg_ParseTuple(args, "y#|ii", &inputBuffer, &bufferLength, &enc_type_arg, &specifiedVoiceHandler)) {
         return NULL;
     }
-
-    /**************Encode Audio in G.722 Mode**************/
-
-    LPVOID hEncInstance = 0;
-    NET_DVR_AUDIOENC_INFO info_param;
-    NET_DVR_AUDIOENC_PROCESS_PARAM  enc_proc_param;
-    memset(&enc_proc_param, 0 ,sizeof(NET_DVR_AUDIOENC_PROCESS_PARAM));
-    
-    unsigned char *encode_input[8192];  //20ms
-    unsigned char *encoded_data[8192];
-    enc_proc_param.in_buf   = (unsigned char *)encode_input;  //输入数据缓冲区，存放编码前PCM原始音频数据
-    enc_proc_param.out_buf  = (unsigned char *)encoded_data;  //输出数据缓冲区，存放编码后音频数据
- 
-    int blockcount= 0;
-    const char *encoderName = NULL;
-    
-    if (ps->compressAudioType.byAudioEncType == 0)
-    {
-        encoderName = "G722";
-        hEncInstance = NET_DVR_InitG722Encoder(&info_param); //初始化G722编码
-    } else if (ps->compressAudioType.byAudioEncType == 1)
-    {
-        encoderName = "G711_U";
-        enc_proc_param.g711_type = 0;
-        hEncInstance = NET_DVR_InitG711Encoder(&info_param);
-        info_param.in_frame_size /= 2;
-    } else if (ps->compressAudioType.byAudioEncType == 2)
-    {
-        encoderName = "G711_A";
-        enc_proc_param.g711_type = 1;
-        hEncInstance = NET_DVR_InitG711Encoder(&info_param);
-    } else if (ps->compressAudioType.byAudioEncType == 4)
-    {
-        encoderName = "G726";
-        // hEncInstance = NET_DVR_InitG726Encoder(&info_param);
+    if (enc_type_arg >= 0) {
+        ps->compressAudioType.byAudioEncType = (BYTE)enc_type_arg;
     }
-    if ((long)hEncInstance == -1)
-    {
-        LONG pErrorNo = NET_DVR_GetLastError();
-        sprintf(ps->error_buffer, "NET_DVR_Init%sEncoder error, %d: %s\n", encoderName, pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+
+    if (bufferLength <= 0) {
+        Py_RETURN_NONE;
+    }
+
+    const char *encoderName = NULL;
+    int enc_type = (int)ps->compressAudioType.byAudioEncType;
+    if (ensure_voice_encoder(ps, enc_type, &encoderName) != 0) {
         PyErr_SetString(PyExc_TypeError, ps->error_buffer);
         return NULL;
     }
 
+    LONG voiceHandler = (specifiedVoiceHandler != -1) ? specifiedVoiceHandler : ps->lVoiceHandler;
+    if (voiceHandler == -1 || voiceHandler == 0) {
+        sprintf(ps->error_buffer, "Voice Talk is not started (handler invalid)");
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+
+    const int frame_size = (int)ps->voiceEncInfo.in_frame_size;
+    if (frame_size <= 0 || frame_size > (int)sizeof(ps->voiceEncInBuf)) {
+        sprintf(ps->error_buffer, "invalid encoder in_frame_size=%d", frame_size);
+        PyErr_SetString(PyExc_TypeError, ps->error_buffer);
+        return NULL;
+    }
+
+    /* Merge carry + new input into a temporary view without huge copies when possible. */
+    const unsigned char *src = (const unsigned char *)inputBuffer;
+    int src_len = (int)bufferLength;
+    unsigned char *merged = NULL;
+    int merged_len = 0;
+    if (ps->voicePcmCarryLen > 0) {
+        merged_len = ps->voicePcmCarryLen + src_len;
+        merged = (unsigned char *)malloc((size_t)merged_len);
+        if (!merged) {
+            PyErr_NoMemory();
+            return NULL;
+        }
+        memcpy(merged, ps->voicePcmCarry, (size_t)ps->voicePcmCarryLen);
+        memcpy(merged + ps->voicePcmCarryLen, src, (size_t)src_len);
+        src = merged;
+        src_len = merged_len;
+        ps->voicePcmCarryLen = 0;
+    }
+
+    NET_DVR_AUDIOENC_PROCESS_PARAM enc_proc_param;
+    memset(&enc_proc_param, 0, sizeof(enc_proc_param));
+    enc_proc_param.in_buf = ps->voiceEncInBuf;
+    enc_proc_param.out_buf = ps->voiceEncOutBuf;
+    if (enc_type == 1) {
+        enc_proc_param.g711_type = 0;
+    } else if (enc_type == 2) {
+        enc_proc_param.g711_type = 1;
+    }
+
     int offset = 0;
-    while (offset < bufferLength)
-    {
+    int blockcount = 0;
+
+    while (offset + frame_size <= src_len) {
+        memcpy(ps->voiceEncInBuf, src + offset, (size_t)frame_size);
+        offset += frame_size;
         blockcount++;
-        if (info_param.in_frame_size > bufferLength - offset)
-            break;
 
-        memcpy(enc_proc_param.in_buf, inputBuffer + offset, info_param.in_frame_size);
-        offset+=info_param.in_frame_size;
-        //PCM数据输入，编码成G722
         BOOL ret = FALSE;
-        if (ps->compressAudioType.byAudioEncType == 0)
-        {
-            ret = NET_DVR_EncodeG722Frame(hEncInstance, &enc_proc_param);
-        } else if (ps->compressAudioType.byAudioEncType == 1 || ps->compressAudioType.byAudioEncType == 2)
-        {
-            ret = NET_DVR_EncodeG711Frame(hEncInstance, &enc_proc_param);//((DWORD)enc_proc_param.g711_type, (BYTE *)enc_proc_param.in_buf, (BYTE *)enc_proc_param.out_buf);
+        if (enc_type == 0) {
+            ret = NET_DVR_EncodeG722Frame(ps->hVoiceEnc, &enc_proc_param);
+        } else if (enc_type == 1 || enc_type == 2) {
+            ret = NET_DVR_EncodeG711Frame(ps->hVoiceEnc, &enc_proc_param);
             enc_proc_param.out_frame_size = 160;
-        } else if (ps->compressAudioType.byAudioEncType == 4)
-        {
-            // ret = NET_DVR_EncodeG726Frame(hEncInstance, &enc_proc_param);
-            ret = false;
+        } else {
+            ret = FALSE;
         }
-        if (ret == FALSE)
-        {
+        if (ret == FALSE) {
             LONG pErrorNo = NET_DVR_GetLastError();
-            sprintf(ps->error_buffer, "NET_DVR_Encode%sFrame error, %d: %s\n", encoderName, pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            sprintf(ps->error_buffer, "NET_DVR_Encode%sFrame error, %d: %s\n",
+                    encoderName ? encoderName : "?", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            if (merged) free(merged);
+            /* Encoder may be in bad state — drop and re-init next time. */
+            release_voice_encoder(ps);
             PyErr_SetString(PyExc_TypeError, ps->error_buffer);
             return NULL;
         }
-        
-        if (!NET_DVR_VoiceComSendData(specifiedVoiceHandler != -1 ? specifiedVoiceHandler : ps->lVoiceHandler, (char*)enc_proc_param.out_buf, enc_proc_param.out_frame_size))
-        {
+
+        if (!NET_DVR_VoiceComSendData(voiceHandler, (char *)ps->voiceEncOutBuf, enc_proc_param.out_frame_size)) {
             LONG pErrorNo = NET_DVR_GetLastError();
-            sprintf(ps->error_buffer, "NET_DVR_VoiceComSendData error, %d: %s\n", pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            sprintf(ps->error_buffer, "NET_DVR_VoiceComSendData error, %d: %s\n",
+                    pErrorNo, NET_DVR_GetErrorMsg(&pErrorNo));
+            if (merged) free(merged);
             PyErr_SetString(PyExc_TypeError, ps->error_buffer);
             return NULL;
         }
-        // printf("sending %d  size = %d\n", blockcount, enc_proc_param.out_frame_size);
-        sleep(0.02);
+
+        /* Absolute 20ms pacing so NVR does not buffer a burst of frames.
+         * sleep(0.02) was a no-op (C sleep is whole seconds). */
+        if (!ps->voicePaceActive) {
+            clock_gettime(CLOCK_MONOTONIC, &ps->voiceNextDeadline);
+            voice_ts_add_ns(&ps->voiceNextDeadline, kVoiceFrameNsec);
+            ps->voicePaceActive = 1;
+        } else {
+            voice_ts_add_ns(&ps->voiceNextDeadline, kVoiceFrameNsec);
+        }
+        {
+            /* Release GIL while sleeping so other Python threads keep running. */
+            Py_BEGIN_ALLOW_THREADS
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ps->voiceNextDeadline, NULL);
+            Py_END_ALLOW_THREADS
+        }
+        /* If we fell far behind real-time, resync so we don't pile up sleep debt
+         * (which would stretch audio). Snap deadline to now+20ms. */
+        {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double late = (now.tv_sec - ps->voiceNextDeadline.tv_sec) +
+                          (now.tv_nsec - ps->voiceNextDeadline.tv_nsec) / 1e9;
+            if (late > 0.08) {
+                ps->voiceNextDeadline = now;
+                voice_ts_add_ns(&ps->voiceNextDeadline, kVoiceFrameNsec);
+            }
+        }
     }
 
-    if (ps->compressAudioType.byAudioEncType == 0)
-    {
-        NET_DVR_ReleaseG722Decoder(&hEncInstance); //初始化G722编码
-    } else if (ps->compressAudioType.byAudioEncType == 1)
-    {
-        NET_DVR_ReleaseG711Encoder(&hEncInstance);
-    } else if (ps->compressAudioType.byAudioEncType == 2)
-    {
-        NET_DVR_ReleaseG711Encoder(&hEncInstance);
-    } else if (ps->compressAudioType.byAudioEncType == 4)
-    {
-        // hEncInstance = NET_DVR_InitG726Encoder(&info_param);
+    /* Save remainder for next sendVoice */
+    int remain = src_len - offset;
+    if (remain > 0) {
+        if (remain > (int)sizeof(ps->voicePcmCarry)) {
+            remain = (int)sizeof(ps->voicePcmCarry);
+        }
+        memcpy(ps->voicePcmCarry, src + offset, (size_t)remain);
+        ps->voicePcmCarryLen = remain;
+    } else {
+        ps->voicePcmCarryLen = 0;
     }
-    
+
+    if (merged) free(merged);
+    (void)blockcount;
     Py_RETURN_NONE;
 }
 
@@ -906,7 +1085,7 @@ void *decode_thread(void *data)
                     fprintf(stderr, "Decode Thread: Receive Packet Timeout\n");
                     return AVERROR_EOF;
                 }
-                sleep(0.02);
+                usleep(20000); /* 20ms (sleep(0.02) is a no-op — C sleep is whole seconds) */
             } else 
             {
                 dp->last_packet_rx = microtime();
@@ -3081,6 +3260,13 @@ static void release(PyObject *self) {
         }
         ps->alarmChannelOpened = false;
     }
+
+    /* Stop talk + release cached encoder before logout. */
+    if (ps->lVoiceHandler != -1 && ps->lVoiceHandler != 0) {
+        NET_DVR_StopVoiceCom(ps->lVoiceHandler);
+        ps->lVoiceHandler = -1;
+    }
+    release_voice_encoder(ps);
 
     //关闭预览
     NET_DVR_Logout(ps->lUserID);
