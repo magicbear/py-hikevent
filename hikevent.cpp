@@ -181,8 +181,8 @@ static PyObject *receiveAlarmEvent(PyObject *self, PyObject *args) {
     NET_DVR_SETUPALARM_PARAM_V50 struSetupAlarmParam = { 0 };
     struSetupAlarmParam.dwSize = sizeof(struSetupAlarmParam);
     struSetupAlarmParam.byRetAlarmTypeV40 = 1;   // variable size
-    // struSetupAlarmParam.byLevel = 2;    // low priority
-    struSetupAlarmParam.byLevel = 0;    // high priority
+    struSetupAlarmParam.byLevel = 2;    // low priority
+    // struSetupAlarmParam.byLevel = 0;    // high priority
     struSetupAlarmParam.byAlarmInfoType = 1;
     struSetupAlarmParam.byRetDevInfoVersion = 1;
     struSetupAlarmParam.byRetVQDAlarmType = 1; //Prefer VQD Alarm type of NET_DVR_VQD_ALARM
@@ -884,7 +884,7 @@ void *decode_thread(void *data)
     AVFormatContext *pFormatCtx = NULL;
     dp->last_packet_rx = microtime();
 
-    if (dp->decode_way >= 3)
+    if ((dp->decode_way & 0xf) >= 3)
     {
         pthread_create(&dp->process_thread, NULL, process_thread, dp);
     }
@@ -893,9 +893,9 @@ void *decode_thread(void *data)
     auto onReadData = [](void* pUser, uint8_t* buf, int bufSize)->int
     {
         HIKEvent_DecodeThread *dp = (HIKEvent_DecodeThread *)pUser;
-        PyHIKEvent_Object *ps = (PyHIKEvent_Object *)dp->ps;
+        // PyHIKEvent_Object *ps = (PyHIKEvent_Object *)dp->ps;
 
-        while (!dp->stop && (dp->decode_way != 3 || ESRCH != pthread_kill(dp->process_thread, 0)))
+        while (!dp->stop && ((dp->decode_way & 0xf) != 3 || ESRCH != pthread_kill(dp->process_thread, 0)))
         {
             pthread_mutex_lock(&dp->lock);
             if (TAILQ_EMPTY(&dp->decode_head))
@@ -916,7 +916,7 @@ void *decode_thread(void *data)
                     TAILQ_REMOVE(&dp->decode_head, p, entries);
                 }
                 pthread_mutex_unlock(&dp->lock);
-                
+
                 size_t wsize = (int)(p->dwBufLen - p->start) > bufSize ? bufSize : (int)(p->dwBufLen - p->start);
                 memcpy(buf, p->data + p->start, wsize);
                 p->start += wsize;
@@ -954,15 +954,15 @@ void *decode_thread(void *data)
     
     int video_stream_idx = -1;
     AVCodecContext *dec_ctx = NULL;
-    static uint8_t *video_src_data[4] = {NULL};
-    static int video_src_bufsize;
+    uint8_t *video_src_data[4] = {NULL};
+    int video_src_bufsize = 0;
 
-    static uint8_t *video_dst_data[4] = {NULL};
-    static int video_dst_bufsize;
+    uint8_t *video_dst_data[4] = {NULL};
+    int video_dst_bufsize = 0;
     AVFrame *frame;
     AVPacket *pkt;
 
-    if (dp->decode_way > 0)
+    if ((dp->decode_way & 0xf) > 0)
     {
         //ffmpeg-------------------------------
         uint8_t* avio_ctx_buffer = (uint8_t*)av_malloc(avio_ctx_buffer_size);
@@ -992,7 +992,7 @@ void *decode_thread(void *data)
         }
         dp->pInputCtx = pFormatCtx;
 
-        if (dp->decode_way >= 3)
+        if ((dp->decode_way & 0xf) >= 3)
         {
             uint8_t *avio_output_ctx_buffer = (uint8_t *)av_malloc(avio_ctx_buffer_size);
             if (!avio_output_ctx_buffer)
@@ -1021,7 +1021,7 @@ void *decode_thread(void *data)
                 goto end;
             }
 
-            if (!(dp->pOutputCtx->oformat = av_guess_format(dp->decode_way == 5 ? "mp4" : "flv", NULL,
+            if (!(dp->pOutputCtx->oformat = av_guess_format((dp->decode_way & 0xf) == 5 ? "mp4" : "flv", NULL,
                                                                       NULL))) {
                 av_log(&pdec_cls, AV_LOG_ERROR, "Could not find output file format\n");
 
@@ -1047,7 +1047,7 @@ void *decode_thread(void *data)
             AVStream *st = pFormatCtx->streams[ret];
 
             /* find decoder for the stream */
-            if (dp->decode_way >= 3)
+            if ((dp->decode_way & 0xf) >= 3)
             {
                 AVStream *out_stream;
 
@@ -1068,14 +1068,15 @@ void *decode_thread(void *data)
             } else 
             {
                 AVCodec *dec = NULL;
-                if (st->codecpar->codec_id == AV_CODEC_ID_H264 && dp->decode_way == 2)
+                bool isByNVDEC = false;
+                if (st->codecpar->codec_id == AV_CODEC_ID_H264 && (dp->decode_way & 0xf) == 2)
                 {
                     dec = avcodec_find_decoder_by_name("h264_cuvid");
                     if (dec == NULL)
                         dec = avcodec_find_decoder_by_name("h264_qsv");
                     if (dec == NULL)
                         dec = avcodec_find_decoder_by_name("h264_v4l2m2m");
-                } else if (st->codecpar->codec_id == AV_CODEC_ID_HEVC && dp->decode_way == 2)
+                } else if (st->codecpar->codec_id == AV_CODEC_ID_HEVC && (dp->decode_way & 0xf) == 2)
                 {
                     dec = avcodec_find_decoder_by_name("hevc_cuvid");
                     if (dec == NULL)
@@ -1092,8 +1093,6 @@ void *decode_thread(void *data)
                     goto end;
                 }
 
-                av_log(&pdec_cls, AV_LOG_INFO, "Decode video using %s -> %s\n", dec->name, dec->long_name);
-
                 dec_ctx = avcodec_alloc_context3(dec);
                 if (!dec_ctx) {
                     av_log(&pdec_cls, AV_LOG_ERROR, "Failed to allocate the %s codec context\n",
@@ -1101,11 +1100,24 @@ void *decode_thread(void *data)
                     goto end;
                 }
 
+                av_log(&pdec_cls, AV_LOG_INFO, "Decode video using %s -> %s  [%lx]\n", dec->name, dec->long_name, (size_t)dec_ctx);
+
                 /* Copy codec parameters from input stream to output codec context */
                 if ((ret = avcodec_parameters_to_context(dec_ctx, st->codecpar)) < 0) {
                     av_log(&pdec_cls, AV_LOG_ERROR, "Failed to copy %s codec parameters to decoder context\n",
                             av_get_media_type_string(AVMEDIA_TYPE_VIDEO));
                     goto end;
+                }
+
+                if (strcmp(dec->name, "h264_cuvid") == 0 || strcmp(dec->name, "hevc_cuvid") == 0)
+                {
+                    isByNVDEC = true;
+                    if (((dp->decode_way & 0xf0) >> 4) != 0)
+                    {
+                        char target_gpu[4];
+                        sprintf(target_gpu, "%d", ((dp->decode_way & 0xf0) >> 4) - 1);
+                        av_opt_set(dec_ctx->priv_data, "gpu", target_gpu, 0);
+                    }
                 }
 
                 /* Init the decoders */
@@ -1122,14 +1134,14 @@ void *decode_thread(void *data)
                 }
 
                 /* allocate image where the decoded image will be put */
-                ret = av_image_alloc(video_src_data, dp->video_src_linesize,
+                video_src_bufsize = av_image_alloc(video_src_data, dp->video_src_linesize,
                                      dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt, 1);
-                if (ret < 0) {
+                if (video_src_bufsize < 0) {
                     av_log(&pdec_cls, AV_LOG_ERROR, "Could not allocate raw video buffer\n");
                     goto end;
                 }
-                video_src_bufsize = ret;
-                if (dec_ctx->pix_fmt != AV_PIX_FMT_RGB24)
+                // Decode Way force by GPU just return NV12 format and process by OpenCV
+                if (dec_ctx->pix_fmt != AV_PIX_FMT_RGB24 && isByNVDEC)
                 {
                     dp->sws_ctx = sws_getContext(dec_ctx->width, dec_ctx->height, dec_ctx->pix_fmt,
                                      dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24,
@@ -1144,12 +1156,11 @@ void *decode_thread(void *data)
                     }
 
                     /* buffer is going to be written to rawvideo file, no alignment */
-                    if ((ret = av_image_alloc(video_dst_data, dp->video_dst_linesize,
+                    if ((video_dst_bufsize = av_image_alloc(video_dst_data, dp->video_dst_linesize,
                                               dec_ctx->width, dec_ctx->height, AV_PIX_FMT_RGB24, 1)) < 0) {
                         av_log(NULL, AV_LOG_ERROR, "Could not allocate destination image\n");
                         goto end;
                     }
-                    video_dst_bufsize = ret;
                 }
                 frame = av_frame_alloc();
                 if (!frame) {
@@ -1167,7 +1178,7 @@ void *decode_thread(void *data)
                 break;
             }
         }
-        if (dp->decode_way >= 3)
+        if ((dp->decode_way & 0xf) >= 3)
         {
             if (ret < 0) {
                 av_log(&pdec_cls, AV_LOG_ERROR, "Could not find %s stream, nb_streams: %d\n",
@@ -1187,7 +1198,7 @@ void *decode_thread(void *data)
         }
     }
     dp->probedone = true;
-    
+
     while (!dp->stop)
     {
         if (dp->decode_way == 0)
@@ -1236,7 +1247,7 @@ void *decode_thread(void *data)
             av_packet_free(&pkt);
             continue;
         }
-        if (dp->decode_way < 3)
+        if ((dp->decode_way & 0xf) < 3)
         {
             if (pkt->stream_index != video_stream_idx)
             {
@@ -1244,6 +1255,7 @@ void *decode_thread(void *data)
                 av_packet_free(&pkt);
                 continue;
             }
+
             // submit the packet to the decoder
             int ret = avcodec_send_packet(dec_ctx, pkt);
             if (ret < 0) {
@@ -1276,33 +1288,35 @@ void *decode_thread(void *data)
                 {
                     size_t video_bufsize;
                     uint8_t *video_data;
-                    if (dp->sws_ctx)
+                    if (dp->sws_ctx != NULL)
                     {
                         video_bufsize = video_src_bufsize;
                         av_image_copy(video_src_data, dp->video_src_linesize,
                           (const uint8_t **)(frame->data), frame->linesize,
                           dec_ctx->pix_fmt, dec_ctx->width, dec_ctx->height);
-                        video_data = video_src_data[0];
-                    } else 
-                    {
+
+                        sws_scale(dp->sws_ctx, (const uint8_t * const*)video_src_data,
+                                    dp->video_src_linesize, 0, dec_ctx->height, video_dst_data, dp->video_dst_linesize);
                         video_bufsize = video_dst_bufsize;
+                        video_data = video_dst_data[0];
+                    }
+                     else 
+                    {
+                        video_bufsize = video_src_bufsize;
                         av_image_copy(video_src_data, dp->video_src_linesize,
                             (const uint8_t **)(frame->data), frame->linesize,
                             dec_ctx->pix_fmt, dec_ctx->width, dec_ctx->height);
                         /* convert to destination format */
-                        sws_scale(dp->sws_ctx, (const uint8_t * const*)video_src_data,
-                                  dp->video_src_linesize, 0, dec_ctx->height, video_dst_data, dp->video_dst_linesize);
-                        video_data = video_dst_data[0];
+                        video_data = video_src_data[0];
                     }
 
                     struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
                     elem->lCommand = DVR_VIDEO_DATA;
-                    // elem->pAlarmInfo = yuvData;
                     elem->pAlarmInfo = (char *)malloc(video_bufsize + 8);
                     elem->dwBufLen = 8 + video_bufsize;
+                    memcpy(elem->pAlarmInfo + 8, video_data, video_bufsize);
                     *((uint32_t *)elem->pAlarmInfo) = dec_ctx->width;
                     *((uint32_t *)elem->pAlarmInfo+1) = dec_ctx->height;
-                    memcpy(elem->pAlarmInfo + 8, video_data, video_bufsize);
                     pthread_mutex_lock(&ps->lock);
                     TAILQ_INSERT_TAIL(&ps->head, elem, entries);
                     pthread_mutex_unlock(&ps->lock);
@@ -1338,7 +1352,7 @@ end:
         dp->stop = 2;
     }
 
-    while (dp->decode_way != 3 || ESRCH != pthread_kill(dp->process_thread, 0))
+    while ((dp->decode_way & 0xf) != 3 || ESRCH != pthread_kill(dp->process_thread, 0))
     {
         // waiting process thread to terminated
         usleep(1000);
@@ -1387,7 +1401,7 @@ end:
     }
     struct entry *elem = (struct entry *)calloc(1, sizeof(struct entry));
     elem->lCommand = DVR_FLV_DATA;
-    elem->pAlarmInfo = (char *)malloc(1);
+    elem->pAlarmInfo = (char *)malloc(2);
     *(int16_t *)elem->pAlarmInfo = dp->channel;
     elem->dwBufLen = 0;
     pthread_mutex_lock(&ps->lock);
@@ -1426,7 +1440,7 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 {
                     fprintf(stderr,"Error: PlayM4_Play %d\n", PlayM4_GetLastError(ps->nPort));
                 }
-            } else if (dp->decode_way > 0 && (dwDataType == NET_DVR_SYSHEAD || dp->decode_way > 2))
+            } else if ((dp->decode_way & 0xf) > 0 && (dwDataType == NET_DVR_SYSHEAD || (dp->decode_way & 0xf) > 2))
             {
                 struct hik_queue_s *elem = (struct hik_queue_s *)calloc(1, sizeof(struct hik_queue_s));
                 if (elem)
@@ -1448,14 +1462,14 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                 {
                     inData = PlayM4_InputData(ps->nPort, pBuffer, dwBufSize);
                 }
-            } else if (dwBufSize > 0 && dp->decode_way > 0) {
+            } else if (dwBufSize > 0 && (dp->decode_way & 0xf) > 0) {
                 program_stream_map_t *psm = (program_stream_map_t *)pBuffer;
                 if (psm->packet_start_code_prefix == 0x010000)
                 {
                     switch (psm->map_stream_id)
                     {
                         case 0xc0:  // Audio
-                            if (dp->decode_way >= 3 && dp->transcode == -1 && dwBufSize == 96)
+                            if ((dp->decode_way & 0xf) >= 3 && dp->transcode == -1 && dwBufSize == 96)
                             {
                                 // mpeg_pes_head_t *pes_head = (mpeg_pes_head_t *)(pBuffer + 6);
 
@@ -1504,7 +1518,7 @@ void CALLBACK g_RealDataCallBack_V30(LONG lRealHandle, DWORD dwDataType, BYTE *p
                                 }
 
                                 break;
-                            } else if (dp->decode_way <= 2)
+                            } else if ((dp->decode_way & 0xf) <= 2)
                             {
                                 break;  // Ignore Audio
                             }
@@ -1594,7 +1608,7 @@ static PyObject *startRealPlay(PyObject *self, PyObject *args) {
     }
 
     dp->decode_way = decode_way;
-    if (dp->decode_way == 4)
+    if ((dp->decode_way & 0xf) == 4)
         dp->transcode = 0;
     else
         dp->transcode = 1;
@@ -2584,6 +2598,47 @@ static PyObject *getevent(PyObject *self, PyObject *args) {
             case COMM_ITS_PLATE_RESULT: // 交通抓拍结果(新报警信息) -> NET_ITS_PLATE_RESULT
             {
                     command="COMM_ITS_PLATE_RESULT";
+                    NET_ITS_PLATE_RESULT *struAlarmInfo = (NET_ITS_PLATE_RESULT *)p->pAlarmInfo;
+                    payload = Py_BuildValue("{s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:y#,s:y#}", 
+                            "MatchNo", struAlarmInfo->dwMatchNo,
+                            "GroupNum", struAlarmInfo->byGroupNum,
+                            "Picture", struAlarmInfo->byPicNo,
+                            "SecondCam", struAlarmInfo->bySecondCam,
+                            "FeaturePicNo" , struAlarmInfo->byFeaturePicNo,
+                            "DriveChan" , struAlarmInfo->byDriveChan,
+                            "VehicleType" , struAlarmInfo->byVehicleType,
+                            "DetSceneID" , struAlarmInfo->byDetSceneID,
+                            "VehicleAttribute" , struAlarmInfo->byVehicleAttribute,
+                            "IllegalType" , struAlarmInfo->wIllegalType,
+                            "IllegalSubType[8]" , struAlarmInfo->byIllegalSubType[8],
+                            "PostPicNo" , struAlarmInfo->byPostPicNo,
+                            "ChanIndex" , struAlarmInfo->byChanIndex,
+                            "SpeedLimit" , struAlarmInfo->wSpeedLimit,
+                            "ChanIndexEx" , struAlarmInfo->byChanIndexEx,
+                            "Dir", struAlarmInfo->byDir,
+                            "DetectType", struAlarmInfo->byDetectType,
+                            "RelaLaneDirectionType", struAlarmInfo->byRelaLaneDirectionType,
+                            "CarDirectionType", struAlarmInfo->byCarDirectionType,
+                            "CustomIllegalType", struAlarmInfo->dwCustomIllegalType,
+                            "IllegalFromatType", struAlarmInfo->byIllegalFromatType,
+                            "Pendant", struAlarmInfo->byPendant,
+                            "DataAnalysis", struAlarmInfo->byDataAnalysis,
+                            "YellowLabelCar", struAlarmInfo->byYellowLabelCar,
+                            "DangerousVehicles", struAlarmInfo->byDangerousVehicles,
+                            "PilotSafebelt", struAlarmInfo->byPilotSafebelt,
+                            "CopilotSafebelt", struAlarmInfo->byCopilotSafebelt,
+                            "PilotSunVisor", struAlarmInfo->byPilotSunVisor,
+                            "CopilotSunVisor", struAlarmInfo->byCopilotSunVisor,
+                            "PilotCall", struAlarmInfo->byPilotCall,
+                            "BarrierGateCtrlType", struAlarmInfo->byBarrierGateCtrlType,
+                            "AlarmDataType", struAlarmInfo->byAlarmDataType,
+                            "PlateType", struAlarmInfo->struPlateInfo.byPlateType,
+                            "PlateColor", struAlarmInfo->struPlateInfo.byColor,
+                            "Bright", struAlarmInfo->struPlateInfo.byBright,
+                            "EntireBelieve", struAlarmInfo->struPlateInfo.byEntireBelieve,
+                            "License", struAlarmInfo->struPlateInfo.sLicense, struAlarmInfo->struPlateInfo.byLicenseLen,
+                            "XmlBuf", struAlarmInfo->struPlateInfo.pXmlBuf, struAlarmInfo->struPlateInfo.dwXmlLen
+                        );
                     break;
             }
             case COMM_ITS_TRAFFIC_COLLECT: // 交通统计数据上传 -> NET_ITS_TRAFFIC_COLLECT
